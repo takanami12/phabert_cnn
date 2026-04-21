@@ -43,7 +43,7 @@ SKIP_PREPARE=false
 USE_LORA=true
 GPU_ID=0
 GROUPS="A B C D"
-FOLDS="0 1 2 3 4"
+FOLDS=5
 N_FAMILIES=26
 BATCH_SIZE=64
 NUM_WORKERS=4
@@ -112,7 +112,7 @@ if [ "$SKIP_ANNOTATE" = false ]; then
     echo "  [0b] Trích xuất đặc trưng chú giải hệ gen → $ANNOT_DIR"
     mkdir -p "$ANNOT_DIR"
     python data_annotation/preprocess_gene_features.py \
-        --data_dir "$RAW_DIR" \
+        --data_dir "data/processed" \
         --hmm_db   "$HMM_DIR/gene_families.hmm" \
         --vocab    "$HMM_DIR/vocabulary.json" \
         --output_dir "$ANNOT_DIR" \
@@ -153,8 +153,8 @@ echo "========================================================"
 
 TRAIN_START=$(date +%s)
 
-for group in $GROUPS; do
-    for fold in $FOLDS; do
+for group in A B C D; do
+    for ((fold=0; fold < $FOLDS; fold++)); do
         echo ""
         echo "--------------------------------------------------------"
         echo "Tiến trình Huấn luyện: Group $group, Fold $fold  [Sử dụng LoRA=$USE_LORA]"
@@ -189,7 +189,7 @@ echo "========================================================"
 echo "Bước 3: Thực thi đánh giá phân loại hình thái..."
 echo "========================================================"
 
-for group in $GROUPS; do
+for group in A B C D; do
     echo ""
     echo "--------------------------------------------------------"
     echo "Đánh giá hiệu suất: Nhóm $group"

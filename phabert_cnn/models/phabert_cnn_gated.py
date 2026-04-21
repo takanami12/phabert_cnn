@@ -5,7 +5,7 @@ import torch.nn as nn
 from transformers import AutoTokenizer, BertConfig
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-from .phabert_cnn import MultiScaleCNNBranch, _patch_dnabert2_triton
+from .phabert_cnn import MultiScaleCNNBranch, _replace_flash_attn
 from .attention import AttentionPooling
 
 
@@ -165,15 +165,16 @@ class PhaBERTCNN_GeneGated(nn.Module):
             trust_remote_code=True,
         )
 
-        # DNABERT-2's rebuild_alibi_tensor() runs tensor arithmetic inside __init__,
-        # which crashes when from_pretrained() constructs the model on meta device
-        # (transformers ≥ 4.38 default).  Patch it to a no-op for the duration of
-        # from_pretrained, then rebuild after weights are materialised on CPU.
         import inspect as _inspect
         _bert_module = _inspect.getmodule(model_cls)
+
+        # Fix 1: skip ALiBi rebuild during from_pretrained (meta-device crash)
         _BertEncoder = _bert_module.BertEncoder
         _orig_rebuild = _BertEncoder.rebuild_alibi_tensor
         _BertEncoder.rebuild_alibi_tensor = lambda self, size, device=None: None
+
+        # Fix 2: replace Triton flash-attn with standard PyTorch attention
+        _replace_flash_attn(_bert_module)
 
         self.backbone = model_cls.from_pretrained(
             dnabert2_model_name,
@@ -184,7 +185,6 @@ class PhaBERTCNN_GeneGated(nn.Module):
 
         _BertEncoder.rebuild_alibi_tensor = _orig_rebuild
         self.backbone.encoder.rebuild_alibi_tensor(size=config.alibi_starting_size)
-        _patch_dnabert2_triton()
 
         # --- Cơ chế chốt kiểm soát gen (Giao thức tiêm dữ liệu Injection 1) ---
         if self.use_gate:

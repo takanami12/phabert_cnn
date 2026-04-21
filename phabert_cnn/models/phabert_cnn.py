@@ -12,42 +12,48 @@ Cấu trúc phân lớp:
     4. Bộ phân loại tuyến tính (Classification head): Ánh xạ không gian 512 chiều sang không gian quyết định nhị phân.
 """
 
-import os
-import re
-import glob
-import shutil
-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel
 from .attention import AttentionPooling
 
 
-def _patch_dnabert2_triton():
+def _replace_flash_attn(bert_module) -> None:
     """
-    Patch DNABERT-2's flash_attn_triton.py for Triton >= 3.0 compatibility.
+    Replace flash_attn_qkvpacked_func in bert_layers' module namespace with a
+    standard PyTorch implementation.
 
-    Triton 3.0 removed the `trans_b` kwarg from `tl.dot()`.  DNABERT-2 revision
-    7bce263b was written for Triton 2.x and uses the old API.  Because Triton
-    kernels are compiled JIT (at first call, not at import), patching the cached
-    source file before the first forward pass is sufficient.
+    DNABERT-2 revision 7bce263b uses a custom Triton flash-attention kernel
+    (flash_attn_triton.py) that relies on the tl.dot(a, b, trans_b=True) API
+    removed in Triton 3.0.  Triton captures the kernel AST at @triton.jit
+    decoration time (import), so patching the source file after import has no
+    effect.  The correct fix is to replace the Python-level function reference
+    that bert_layers.BertSelfAttention.forward looks up in its module globals.
     """
-    cache = os.path.expanduser("~/.cache/huggingface/modules")
-    changed = False
-    for path in glob.glob(os.path.join(cache, "**", "flash_attn_triton.py"), recursive=True):
-        text = open(path).read()
-        new = re.sub(
-            r'tl\.dot\((\w+),\s*(\w+),\s*trans_b=True\)',
-            lambda m: f'tl.dot({m.group(1)}, tl.trans({m.group(2)}))',
-            text,
-        )
-        if new != text:
-            open(path, 'w').write(new)
-            changed = True
-    if changed:
-        # Clear Triton's compiled-kernel cache so it recompiles with the patch.
-        for d in glob.glob(os.path.expanduser("~/.triton/cache"), recursive=False):
-            shutil.rmtree(d, ignore_errors=True)
+
+    def _std_attn(qkv, bias=None, softmax_scale=None, causal=False, **_kw):
+        # qkv: (B, S, 3, H, D) — packed Q/K/V in DNABERT-2's padded format
+        dtype = qkv.dtype
+        B, S, _, H, D = qkv.shape
+        q, k, v = qkv.unbind(dim=2)             # each (B, S, H, D)
+        q = q.transpose(1, 2)                   # (B, H, S, D)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        scale = softmax_scale or (D ** -0.5)
+        if bias is None and not causal:
+            out = F.scaled_dot_product_attention(q, k, v, scale=scale)
+        else:
+            scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+            if bias is not None:
+                scores = scores + bias
+            if causal:
+                mask = torch.triu(torch.ones(S, S, dtype=torch.bool, device=qkv.device), diagonal=1)
+                scores.masked_fill_(mask, float('-inf'))
+            out = torch.matmul(F.softmax(scores.float(), dim=-1).to(dtype), v)
+        return out.transpose(1, 2).contiguous()  # (B, S, H, D)
+
+    bert_module.flash_attn_qkvpacked_func = _std_attn
 
 
 class MultiScaleCNNBranch(nn.Module):
@@ -143,9 +149,14 @@ class PhaBERTCNN(nn.Module):
 
         import inspect as _inspect
         _bert_module = _inspect.getmodule(model_cls)
+
+        # Fix 1: skip ALiBi rebuild during from_pretrained (meta-device crash)
         _BertEncoder = _bert_module.BertEncoder
         _orig_rebuild = _BertEncoder.rebuild_alibi_tensor
         _BertEncoder.rebuild_alibi_tensor = lambda self, size, device=None: None
+
+        # Fix 2: replace Triton flash-attn with standard PyTorch attention
+        _replace_flash_attn(_bert_module)
 
         self.backbone = model_cls.from_pretrained(
             dnabert2_model_name,
@@ -155,7 +166,6 @@ class PhaBERTCNN(nn.Module):
 
         _BertEncoder.rebuild_alibi_tensor = _orig_rebuild
         self.backbone.encoder.rebuild_alibi_tensor(size=config.alibi_starting_size)
-        _patch_dnabert2_triton()
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             dnabert2_model_name,

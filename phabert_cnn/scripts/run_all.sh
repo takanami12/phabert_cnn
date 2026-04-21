@@ -101,17 +101,17 @@ if [ "$SKIP_ANNOTATE" = false ]; then
     echo "========================================================"
 
     HMM_DIR="data/hmm"
-    ANNOT_DIR="$ROOT_DIR/data/annotations/raw"
+    ANNOT_DIR="data/annotations/raw"
     RAW_DIR="data/raw"
 
     echo "  [0a] Xây dựng cơ sở dữ liệu HMM (Chiến lược bảo lưu: $HMM_STRATEGY)..."
-    python annotate_data/prepare_hmm_profiles.py \
+    python data_annotation/prepare_hmm_profiles.py \
         --strategy "$HMM_STRATEGY" \
         --output_dir "$HMM_DIR"
 
     echo "  [0b] Trích xuất đặc trưng chú giải hệ gen → $ANNOT_DIR"
     mkdir -p "$ANNOT_DIR"
-    python annotate_data/preprocess_gene_features.py \
+    python data_annotation/preprocess_gene_features.py \
         --data_dir "$RAW_DIR" \
         --hmm_db   "$HMM_DIR/gene_families.hmm" \
         --vocab    "$HMM_DIR/vocabulary.json" \

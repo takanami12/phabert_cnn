@@ -1,0 +1,142 @@
+# PhaBERT-CNN Configuration
+# All hyperparameters as described in the paper
+
+# ============================================================
+# Data Configuration
+# ============================================================
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  
+  # Dataset: 2241 complete phage genomes (707 temperate, 1534 virulent)
+  # Labels: 0 = temperate, 1 = virulent
+  num_folds: 5          # Stratified 5-fold cross-validation
+  train_val_ratio: 0.8  # 80% train, 20% val within each fold
+  random_seed: 42
+
+  # Contig generation parameters
+  contig_groups:
+    A:
+      min_length: 100
+      max_length: 400
+      overlap_pct: 0.1   # Lower overlap for shorter contigs
+    B:
+      min_length: 400
+      max_length: 800
+      overlap_pct: 0.2
+    C:
+      min_length: 800
+      max_length: 1200
+      overlap_pct: 0.3
+    D:
+      min_length: 1200
+      max_length: 1800
+      overlap_pct: 0.4   # Higher overlap for longer contigs
+
+  # Data augmentation: reverse complement
+  use_reverse_complement: true
+  
+  # Class balancing: random undersampling on training set
+  use_undersampling: true
+
+# ============================================================
+# Model Configuration
+# ============================================================
+model:
+  # DNABERT-2 backbone
+  dnabert2_model_name: "zhihan1996/DNABERT-2-117M"
+  embedding_dim: 768    # DNABERT-2 output dimension
+  
+  # Multi-scale CNN branch
+  cnn:
+    kernel_sizes: [3, 5, 7]           # 3 parallel conv pathways
+    channels: [768, 256, 128]         # Progressive channel reduction
+    # Each branch: Conv1d(768->256) -> BN -> ReLU -> Conv1d(256->128) -> BN -> ReLU -> AdaptiveMaxPool1d(1)
+  
+  # Attention-based pooling branch
+  attention:
+    hidden_dim: 64      # Intermediate attention dimension
+    dropout: 0.1
+  
+  # Global feature projection (after attention pooling)
+  global_projection_dim: 128  # 768 -> 128
+  
+  # Classification head
+  classifier:
+    input_dim: 512      # 128*3 (CNN) + 128 (attention) = 512
+    hidden_dim: 256
+    num_classes: 2
+    dropout: 0.1
+
+# ============================================================
+# Training Configuration
+# ============================================================
+training:
+  # Phase 1: Warm-up (freeze DNABERT-2, train task-specific layers)
+  warmup_phase:
+    num_epochs: 1
+    freeze_backbone: true
+    optimizer:
+      type: "AdamW"
+      lr: 2.0e-3
+      weight_decay: 1.0e-4
+      betas: [0.9, 0.999]
+    scheduler:
+      type: "OneCycleLR"
+      pct_start: 0.3       # 30% warm-up period
+      div_factor: 5         # initial_lr = max_lr / div_factor
+      final_div_factor: 10  # final_lr = initial_lr / final_div_factor
+
+  # Phase 2: Full fine-tuning (discriminative learning rates)
+  finetune_phase:
+    num_epochs: 10
+    freeze_backbone: false
+    # Discriminative learning rates
+    backbone_optimizer:
+      type: "AdamW"
+      lr: 1.0e-5           # Conservative LR for DNABERT-2
+      weight_decay: 1.0e-5
+      betas: [0.9, 0.999]
+      eps: 1.0e-6
+    task_optimizer:
+      type: "AdamW"
+      lr: 1.0e-4           # 10x higher LR for task layers
+      weight_decay: 1.0e-4
+      betas: [0.9, 0.999]
+      eps: 1.0e-6
+    scheduler:
+      type: "OneCycleLR"
+      pct_start: 0.1        # 10% warm-up period
+      div_factor: 5
+      final_div_factor: 50
+    
+    # Early stopping
+    early_stopping:
+      monitor: "val_accuracy"
+      patience: 3
+      mode: "max"
+
+  # General training settings
+  batch_size: 16
+  num_workers: 4
+  max_seq_length: 512     # Max tokens for DNABERT-2 input
+  
+  # Loss function
+  loss: "CrossEntropyLoss"
+
+# ============================================================
+# Evaluation Configuration  
+# ============================================================
+evaluation:
+  metrics: ["sensitivity", "specificity", "accuracy"]
+  # sn = TP / (TP + FN)  -- ability to identify virulent phages
+  # sp = TN / (TN + FP)  -- ability to identify temperate phages
+  # acc = (TP + TN) / (TP + FN + TN + FP)
+
+# ============================================================
+# Output Configuration
+# ============================================================
+output:
+  checkpoint_dir: "results/checkpoints"
+  log_dir: "results/logs"
+  result_dir: "results/metrics"

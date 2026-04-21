@@ -1,0 +1,44 @@
+# Ignore everything in the root directory by default
+/*
+
+# ----------------------------------------------------
+# Whitelist specifically requested by user
+# ----------------------------------------------------
+!/phabert_cnn/
+!/environment.yml
+!/requirements.txt
+!/README.md
+!/.gitignore
+
+# ----------------------------------------------------
+# Global exclusion rules (apply inside the whitelisted folders)
+# ----------------------------------------------------
+
+# Compiled Python files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch Checkpoints and Saved Models
+*.pt
+*.pth
+
+# Data / Generated Datasets
+/phabert_cnn/data/
+
+# Results / Logs inside phabert_cnn (if any)
+/phabert_cnn/results/
+/phabert_cnn/logs/
+
+# ID/IDE
+.idea/
+.vscode/
+
+# Virtual Environments
+venv/
+env/
+.env
+
+# Others
+.DS_Store
+.ipynb_checkpoints/

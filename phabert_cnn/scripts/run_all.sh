@@ -131,7 +131,7 @@ if [ "$SKIP_PREPARE" = false ]; then
     echo "========================================================"
 
     HMM_DIR="data/hmm"
-    ANNOT_DIR="$ROOT_DIR/data/annotations/raw"
+    ANNOT_DIR="$ROOT_DIR/phabert_cnn/data/annotations/raw"
 
     python scripts/prepare_data.py \
         --data_dir   data/raw \

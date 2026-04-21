@@ -168,6 +168,7 @@ class PhaBERTCNN_GeneGated(nn.Module):
             dnabert2_model_name,
             config=config,
             revision=_revision,
+            low_cpu_mem_usage=False,
         )
 
         # --- Cơ chế chốt kiểm soát gen (Giao thức tiêm dữ liệu Injection 1) ---

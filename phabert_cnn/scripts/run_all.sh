@@ -1,42 +1,42 @@
 #!/bin/bash
 # ============================================================
-# PhaBERT-CNN: Quy trình Thực nghiệm Toàn diện
+# PhaBERT-CNN: End-to-End Experiment Pipeline
 #
-# Kịch bản thực thi toàn bộ pipeline:
-#   0. (Tùy chọn) Quy trình gán nhãn lược đồ HMM (HMM annotation pipeline)
-#   1. (Tùy chọn) Tiền xử lý và chuẩn bị dữ liệu (Data preparation)
-#   2. Huấn luyện (Training) — trên toàn bộ các nhóm (groups) × các nếp gấp (folds)
-#   3. Đánh giá (Evaluation) — trên toàn bộ các phân nhóm
+# Runs the full pipeline in order:
+#   0. (Optional) HMM annotation pipeline
+#   1. (Optional) Data preparation (contigs + feature vectors)
+#   2. Training  — across all groups × folds
+#   3. Evaluation — across all groups
 #
-# Hướng dẫn sử dụng:
-#   # Thực thi toàn bộ (từ thư mục gốc hoặc từ thư mục scripts/):
+# Usage:
+#   # Full run (from project root or scripts/ directory):
 #   bash phabert_cnn/scripts/run_all.sh
 #
-#   # Lược bỏ bước gán nhãn và chuẩn bị dữ liệu (khi dữ liệu đã sẵn sàng):
+#   # Skip annotation and data preparation (data already ready):
 #   bash phabert_cnn/scripts/run_all.sh --skip_annotate --skip_prepare
 #
-#   # Huấn luyện không sử dụng LoRA (thời gian huấn luyện lâu hơn, tinh chỉnh toàn bộ tham số):
+#   # Train without LoRA (full fine-tune, slower):
 #   bash phabert_cnn/scripts/run_all.sh --no_lora
 #
-#   # Lựa chọn thiết bị cấu hình GPU:
+#   # Select GPU:
 #   bash phabert_cnn/scripts/run_all.sh --gpu=1
 #
-#   # Chỉ định các phân nhóm / nếp gấp cụ thể:
+#   # Specific groups / folds:
 #   bash phabert_cnn/scripts/run_all.sh --groups=A,B --folds=0,1,2
 # ============================================================
 
-set -e   # Chấm dứt ngay khi gặp lỗi đầu tiên
-set -u   # Xử lý các biến chưa được gán giá trị như một lỗi hệ thống
+set -e   # Exit immediately on first error
+set -u   # Treat unset variables as errors
 
-# ---- Luôn thiết lập đường dẫn tương đối tới thư mục gói phabert_cnn/ ----
+# ---- Always resolve paths relative to the phabert_cnn/ package directory ----
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"          # Thư mục phabert_cnn/
-ROOT_DIR="$(cd "$PKG_DIR/.." && pwd)"            # Thư mục gốc dự án
+PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"          # phabert_cnn/ package dir
+ROOT_DIR="$(cd "$PKG_DIR/.." && pwd)"            # project root dir
 cd "$PKG_DIR"
 echo "Working directory: $(pwd)"
 
 # ============================================================
-# Thiết lập các tham số mặc định (Defaults)
+# Default parameters
 # ============================================================
 SKIP_ANNOTATE=false
 SKIP_PREPARE=false
@@ -53,7 +53,7 @@ PATIENCE=3
 HMM_STRATEGY="pfam"    # pfam | vog | combined
 
 # ============================================================
-# Phân tích cú pháp đối số đầu vào (Parse arguments)
+# Parse arguments
 # ============================================================
 for arg in "$@"; do
     case $arg in
@@ -69,7 +69,7 @@ for arg in "$@"; do
 done
 
 # ============================================================
-# Cấu hình biến môi trường (Environment Config)
+# Environment config
 # ============================================================
 export CUDA_VISIBLE_DEVICES=$GPU_ID
 export TOKENIZERS_PARALLELISM=false
@@ -81,35 +81,35 @@ if [ "$USE_LORA" = true ]; then
 fi
 
 echo "========================================================"
-echo "Quy trình Thực nghiệm PhaBERT-CNN"
-echo "  GPU:           $GPU_ID"
-echo "  Groups:        $GROUPS"
-echo "  Folds:         $FOLDS"
-echo "  LoRA:          $USE_LORA"
-echo "  n_families:    $N_FAMILIES"
-echo "  Số kỷ nguyên tối ưu hóa sơ bộ (Warmup epochs): $WARMUP_EPOCHS"
-echo "  Số kỷ nguyên tinh chỉnh (Finetune epochs): $FINETUNE_EPOCHS"
+echo "PhaBERT-CNN Experiment Pipeline"
+echo "  GPU:             $GPU_ID"
+echo "  Groups:          $GROUPS"
+echo "  Folds:           $FOLDS"
+echo "  LoRA:            $USE_LORA"
+echo "  n_families:      $N_FAMILIES"
+echo "  Warmup epochs:   $WARMUP_EPOCHS"
+echo "  Finetune epochs: $FINETUNE_EPOCHS"
 echo "========================================================"
 
 # ============================================================
-# Bước 0: Quy trình gán nhãn (HMM profiles + đặc trưng gene)
+# Step 0: Annotation pipeline (HMM profiles + gene features)
 # ============================================================
 if [ "$SKIP_ANNOTATE" = false ]; then
     echo ""
     echo "========================================================"
-    echo "Bước 0: Khởi chạy quy trình gán nhãn (Annotation pipeline)"
+    echo "Step 0: Running annotation pipeline"
     echo "========================================================"
 
     HMM_DIR="data/hmm"
     ANNOT_DIR="data/annotations/raw"
     RAW_DIR="data/raw"
 
-    echo "  [0a] Xây dựng cơ sở dữ liệu HMM (Chiến lược bảo lưu: $HMM_STRATEGY)..."
+    echo "  [0a] Building HMM database (strategy: $HMM_STRATEGY)..."
     python data_annotation/prepare_hmm_profiles.py \
         --strategy "$HMM_STRATEGY" \
         --output_dir "$HMM_DIR"
 
-    echo "  [0b] Trích xuất đặc trưng chú giải hệ gen → $ANNOT_DIR"
+    echo "  [0b] Extracting genome annotation features → $ANNOT_DIR"
     mkdir -p "$ANNOT_DIR"
     python data_annotation/preprocess_gene_features.py \
         --data_dir "data/processed" \
@@ -118,16 +118,16 @@ if [ "$SKIP_ANNOTATE" = false ]; then
         --output_dir "$ANNOT_DIR" \
         --complete_genome
 
-    echo "  Hoàn tất Bước 0."
+    echo "  Step 0 done."
 fi
 
 # ============================================================
-# Bước 1: Chuẩn bị dữ liệu (các đoạn contig + vector đặc trưng)
+# Step 1: Data preparation (contigs + feature vectors)
 # ============================================================
 if [ "$SKIP_PREPARE" = false ]; then
     echo ""
     echo "========================================================"
-    echo "Bước 1: Khởi tạo quy trình chuẩn bị dữ liệu..."
+    echo "Step 1: Preparing data..."
     echo "========================================================"
 
     HMM_DIR="data/hmm"
@@ -140,15 +140,15 @@ if [ "$SKIP_PREPARE" = false ]; then
         --vocab      "$HMM_DIR/vocabulary.json" \
         --skip_download
 
-    echo "  Hoàn tất Bước 1."
+    echo "  Step 1 done."
 fi
 
 # ============================================================
-# Bước 2: Huấn luyện (Training) — trên toàn bộ các nhóm × các nếp gấp
+# Step 2: Training — all groups × folds
 # ============================================================
 echo ""
 echo "========================================================"
-echo "Bước 2: Tiến hành huấn luyện mô hình..."
+echo "Step 2: Training..."
 echo "========================================================"
 
 TRAIN_START=$(date +%s)
@@ -157,7 +157,7 @@ for group in A B C D; do
     for ((fold=0; fold < $FOLDS; fold++)); do
         echo ""
         echo "--------------------------------------------------------"
-        echo "Tiến trình Huấn luyện: Group $group, Fold $fold  [Sử dụng LoRA=$USE_LORA]"
+        echo "Training: Group $group, Fold $fold  [LoRA=$USE_LORA]"
         echo "--------------------------------------------------------"
 
         python scripts/train.py \
@@ -172,27 +172,27 @@ for group in A B C D; do
             --patience        "$PATIENCE"        \
             $LORA_FLAG
 
-        echo "  Hoàn thành Huấn luyện: Group $group, Fold $fold"
+        echo "  Done: Group $group, Fold $fold"
     done
 done
 
 TRAIN_END=$(date +%s)
 TRAIN_ELAPSED=$(( TRAIN_END - TRAIN_START ))
 echo ""
-echo "  Tổng thời gian huấn luyện thực thi: $(( TRAIN_ELAPSED / 3600 ))h $(( (TRAIN_ELAPSED % 3600) / 60 ))m"
+echo "  Total training time: $(( TRAIN_ELAPSED / 3600 ))h $(( (TRAIN_ELAPSED % 3600) / 60 ))m"
 
 # ============================================================
-# Bước 3: Đánh giá mô hình (Evaluation) — trên toàn bộ các nhóm
+# Step 3: Evaluation — all groups
 # ============================================================
 echo ""
 echo "========================================================"
-echo "Bước 3: Thực thi đánh giá phân loại hình thái..."
+echo "Step 3: Evaluating..."
 echo "========================================================"
 
 for group in A B C D; do
     echo ""
     echo "--------------------------------------------------------"
-    echo "Đánh giá hiệu suất: Nhóm $group"
+    echo "Evaluating: Group $group"
     echo "--------------------------------------------------------"
 
     python scripts/evaluate.py \
@@ -203,16 +203,16 @@ for group in A B C D; do
         --eval_split  val            \
         $LORA_FLAG
 
-    echo "  Hoàn tất Đánh giá: Nhóm $group"
+    echo "  Done: Group $group"
 done
 
 # ============================================================
-# Tổng kết báo cáo (Summary)
+# Summary
 # ============================================================
 echo ""
 echo "========================================================"
-echo "Hoàn thành toàn bộ Thực nghiệm!"
+echo "All experiments complete!"
 echo "========================================================"
 echo ""
-echo "  Metrics: $PKG_DIR/results/metrics/"
+echo "  Metrics:     $PKG_DIR/results/metrics/"
 echo "  Checkpoints: $PKG_DIR/results/group_*/fold_*/"

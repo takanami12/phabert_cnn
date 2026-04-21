@@ -111,6 +111,7 @@ class PhaBERTCNN(nn.Module):
         self.backbone = model_cls.from_pretrained(
             dnabert2_model_name,
             config=config,
+            low_cpu_mem_usage=False,
         )
 
         self.tokenizer = AutoTokenizer.from_pretrained(

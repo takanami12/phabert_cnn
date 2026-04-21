@@ -5,7 +5,7 @@ import torch.nn as nn
 from transformers import AutoTokenizer, BertConfig
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-from .phabert_cnn import MultiScaleCNNBranch
+from .phabert_cnn import MultiScaleCNNBranch, _patch_dnabert2_triton
 from .attention import AttentionPooling
 
 
@@ -184,6 +184,7 @@ class PhaBERTCNN_GeneGated(nn.Module):
 
         _BertEncoder.rebuild_alibi_tensor = _orig_rebuild
         self.backbone.encoder.rebuild_alibi_tensor(size=config.alibi_starting_size)
+        _patch_dnabert2_triton()
 
         # --- Cơ chế chốt kiểm soát gen (Giao thức tiêm dữ liệu Injection 1) ---
         if self.use_gate:

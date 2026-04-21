@@ -12,10 +12,42 @@ Cấu trúc phân lớp:
     4. Bộ phân loại tuyến tính (Classification head): Ánh xạ không gian 512 chiều sang không gian quyết định nhị phân.
 """
 
+import os
+import re
+import glob
+import shutil
+
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, AutoModel
 from .attention import AttentionPooling
+
+
+def _patch_dnabert2_triton():
+    """
+    Patch DNABERT-2's flash_attn_triton.py for Triton >= 3.0 compatibility.
+
+    Triton 3.0 removed the `trans_b` kwarg from `tl.dot()`.  DNABERT-2 revision
+    7bce263b was written for Triton 2.x and uses the old API.  Because Triton
+    kernels are compiled JIT (at first call, not at import), patching the cached
+    source file before the first forward pass is sufficient.
+    """
+    cache = os.path.expanduser("~/.cache/huggingface/modules")
+    changed = False
+    for path in glob.glob(os.path.join(cache, "**", "flash_attn_triton.py"), recursive=True):
+        text = open(path).read()
+        new = re.sub(
+            r'tl\.dot\((\w+),\s*(\w+),\s*trans_b=True\)',
+            lambda m: f'tl.dot({m.group(1)}, tl.trans({m.group(2)}))',
+            text,
+        )
+        if new != text:
+            open(path, 'w').write(new)
+            changed = True
+    if changed:
+        # Clear Triton's compiled-kernel cache so it recompiles with the patch.
+        for d in glob.glob(os.path.expanduser("~/.triton/cache"), recursive=False):
+            shutil.rmtree(d, ignore_errors=True)
 
 
 class MultiScaleCNNBranch(nn.Module):
@@ -123,6 +155,7 @@ class PhaBERTCNN(nn.Module):
 
         _BertEncoder.rebuild_alibi_tensor = _orig_rebuild
         self.backbone.encoder.rebuild_alibi_tensor(size=config.alibi_starting_size)
+        _patch_dnabert2_triton()
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             dnabert2_model_name,

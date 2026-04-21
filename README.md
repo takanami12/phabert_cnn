@@ -13,11 +13,12 @@
 ## 📁 Cấu Trúc Dự Án
 ```text
 phabert_cnn/
-├── annotate_data/        # Xử lý CSDL HMM, quét và tiên đoán các nhóm gen đặc trưng
+├── data_annotation/        # Xử lý CSDL HMM, quét và tiên đoán các nhóm gen đặc trưng
 ├── models/               # Khởi tạo thuật toán phân loại (Baseline và Gated)
 ├── scripts/              # Chứa mã nguồn chính (Chuẩn bị Dữ liệu, Huấn luyện, Đánh giá)
 ├── utils/                # Các tiện ích (Trích xuất các phép đo mét-rích, Xử lý tính hiệu chuẩn chéo)
 ```
+Dữ liệu được lưu ở link drive sau: https://drive.google.com/drive/folders/1EHFSOyCk38UqWvrX9kerKo2eTNSoe4bp?usp=drive_link
 
 ## ⚙️ Cài Đặt
 ```bash

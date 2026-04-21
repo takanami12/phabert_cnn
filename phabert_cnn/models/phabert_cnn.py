@@ -108,11 +108,21 @@ class PhaBERTCNN(nn.Module):
             dnabert2_model_name,
             trust_remote_code=True,
         )
+
+        import inspect as _inspect
+        _bert_module = _inspect.getmodule(model_cls)
+        _BertEncoder = _bert_module.BertEncoder
+        _orig_rebuild = _BertEncoder.rebuild_alibi_tensor
+        _BertEncoder.rebuild_alibi_tensor = lambda self, size, device=None: None
+
         self.backbone = model_cls.from_pretrained(
             dnabert2_model_name,
             config=config,
             low_cpu_mem_usage=False,
         )
+
+        _BertEncoder.rebuild_alibi_tensor = _orig_rebuild
+        self.backbone.encoder.rebuild_alibi_tensor(size=config.alibi_starting_size)
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             dnabert2_model_name,

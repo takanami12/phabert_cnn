@@ -164,12 +164,26 @@ class PhaBERTCNN_GeneGated(nn.Module):
             revision=_revision,
             trust_remote_code=True,
         )
+
+        # DNABERT-2's rebuild_alibi_tensor() runs tensor arithmetic inside __init__,
+        # which crashes when from_pretrained() constructs the model on meta device
+        # (transformers ≥ 4.38 default).  Patch it to a no-op for the duration of
+        # from_pretrained, then rebuild after weights are materialised on CPU.
+        import inspect as _inspect
+        _bert_module = _inspect.getmodule(model_cls)
+        _BertEncoder = _bert_module.BertEncoder
+        _orig_rebuild = _BertEncoder.rebuild_alibi_tensor
+        _BertEncoder.rebuild_alibi_tensor = lambda self, size, device=None: None
+
         self.backbone = model_cls.from_pretrained(
             dnabert2_model_name,
             config=config,
             revision=_revision,
             low_cpu_mem_usage=False,
         )
+
+        _BertEncoder.rebuild_alibi_tensor = _orig_rebuild
+        self.backbone.encoder.rebuild_alibi_tensor(size=config.alibi_starting_size)
 
         # --- Cơ chế chốt kiểm soát gen (Giao thức tiêm dữ liệu Injection 1) ---
         if self.use_gate:

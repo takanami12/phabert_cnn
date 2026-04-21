@@ -12,7 +12,7 @@
 
 ## 📁 Cấu Trúc Dự Án
 ```text
-src/
+phabert_cnn/
 ├── annotate_data/        # Xử lý CSDL HMM, quét và tiên đoán các nhóm gen đặc trưng
 ├── models/               # Khởi tạo thuật toán phân loại (Baseline và Gated)
 ├── scripts/              # Chứa mã nguồn chính (Chuẩn bị Dữ liệu, Huấn luyện, Đánh giá)

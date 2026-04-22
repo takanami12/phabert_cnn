@@ -41,6 +41,7 @@ echo "Working directory: $(pwd)"
 SKIP_ANNOTATE=false
 SKIP_PREPARE=false
 USE_LORA=true
+USE_COMPILE=true
 GPU_ID=0
 GROUPS="A B C D"
 FOLDS=5
@@ -60,6 +61,7 @@ for arg in "$@"; do
         --skip_annotate)   SKIP_ANNOTATE=true  ;;
         --skip_prepare)    SKIP_PREPARE=true   ;;
         --no_lora)         USE_LORA=false       ;;
+        --no_compile)      USE_COMPILE=false    ;;
         --gpu=*)           GPU_ID="${arg#*=}"   ;;
         --groups=*)        GROUPS="${arg#*=}"; GROUPS="${GROUPS//,/ }" ;;
         --folds=*)         FOLDS="${arg#*=}";  FOLDS="${FOLDS//,/ }"  ;;
@@ -80,12 +82,18 @@ if [ "$USE_LORA" = true ]; then
     LORA_FLAG="--lora"
 fi
 
+COMPILE_FLAG=""
+if [ "$USE_COMPILE" = true ]; then
+    COMPILE_FLAG="--compile"
+fi
+
 echo "========================================================"
 echo "PhaBERT-CNN Experiment Pipeline"
 echo "  GPU:             $GPU_ID"
 echo "  Groups:          $GROUPS"
 echo "  Folds:           $FOLDS"
 echo "  LoRA:            $USE_LORA"
+echo "  torch.compile:   $USE_COMPILE"
 echo "  n_families:      $N_FAMILIES"
 echo "  Warmup epochs:   $WARMUP_EPOCHS"
 echo "  Finetune epochs: $FINETUNE_EPOCHS"
@@ -170,7 +178,8 @@ for group in A B C D; do
             --warmup_epochs   "$WARMUP_EPOCHS"   \
             --finetune_epochs "$FINETUNE_EPOCHS" \
             --patience        "$PATIENCE"        \
-            $LORA_FLAG
+            $LORA_FLAG                           \
+            $COMPILE_FLAG
 
         echo "  Done: Group $group, Fold $fold"
     done

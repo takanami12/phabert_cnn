@@ -76,8 +76,9 @@ def parse_args():
     parser.add_argument("--lora_alpha", type=int, default=16,
                         help="Hệ số scaling alpha của LoRA (mặc định 16)")
     parser.add_argument("--lora_dropout", type=float, default=0.05)
-    parser.add_argument("--lora_targets", type=str, default="query,value",
-                        help="Tên module attention cho LoRA, phân cách bởi dấu phẩy")
+    parser.add_argument("--lora_targets", type=str, default="Wqkv",
+                        help="Tên module attention cho LoRA, phân cách bởi dấu phẩy "
+                             "(DNABERT-2 dùng 'Wqkv' — combined QKV projection)")
     parser.add_argument("--cache_embeddings", action="store_true",
                         help="Phase 1: cache hidden states backbone xuống disk. "
                              "Chỉ có lợi khi --warmup_epochs >= 2.")

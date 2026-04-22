@@ -917,6 +917,18 @@ Examples:
             parser.error(f"No FASTA files found")
 
         for fasta_path in fasta_files:
+            # Determine output path early so we can skip if it already exists
+            if args.output and len(fasta_files) == 1:
+                skip_check_path = Path(args.output)
+            elif args.output_dir:
+                skip_check_path = Path(args.output_dir) / f"{fasta_path.stem}_features.pt"
+            else:
+                skip_check_path = fasta_path.with_suffix(".features.pt")
+
+            if skip_check_path.exists():
+                print(f"  SKIP {fasta_path.name} (features already exist: {skip_check_path})")
+                continue
+
             print(f"\n{'─'*50}")
             print(f"File: {fasta_path.name}")
             print(f"{'─'*50}")

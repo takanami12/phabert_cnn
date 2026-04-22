@@ -50,7 +50,7 @@ NUM_WORKERS=4
 WARMUP_EPOCHS=1
 FINETUNE_EPOCHS=10
 PATIENCE=3
-HMM_STRATEGY="pfam"    # pfam | vog | combined
+HMM_STRATEGY="combined"    # pfam | vog | combined
 
 # ============================================================
 # Parse arguments
@@ -109,12 +109,12 @@ if [ "$SKIP_ANNOTATE" = false ]; then
         --strategy "$HMM_STRATEGY" \
         --output_dir "$HMM_DIR"
 
-    echo "  [0b] Extracting genome annotation features → $ANNOT_DIR"
+    echo "  [0b] Annotating complete genomes (FASTA mode) → $ANNOT_DIR"
     mkdir -p "$ANNOT_DIR"
     python data_annotation/preprocess_gene_features.py \
-        --data_dir "data/processed" \
-        --hmm_db   "$HMM_DIR/gene_families.hmm" \
-        --vocab    "$HMM_DIR/vocabulary.json" \
+        --contig_dir "$RAW_DIR" \
+        --hmm_db     "$HMM_DIR/gene_families.hmm" \
+        --vocab      "$HMM_DIR/vocabulary.json" \
         --output_dir "$ANNOT_DIR" \
         --complete_genome
 

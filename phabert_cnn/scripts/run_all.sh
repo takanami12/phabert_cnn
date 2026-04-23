@@ -172,6 +172,8 @@ for group in A B C D; do
             --group           "$group"           \
             --fold            "$fold"            \
             --gated                              \
+            --use_codon                          \
+            --use_cross_attn                     \
             --n_families      "$N_FAMILIES"      \
             --batch_size      "$BATCH_SIZE"      \
             --num_workers     "$NUM_WORKERS"     \
@@ -207,6 +209,8 @@ for group in A B C D; do
     python scripts/evaluate.py \
         --group       "$group"       \
         --gated                      \
+        --use_codon                  \
+        --use_cross_attn             \
         --n_families  "$N_FAMILIES"  \
         --num_workers "$NUM_WORKERS" \
         --eval_split  val            \

@@ -36,10 +36,12 @@ class PhageContigDataset(Dataset):
         max_length: int = 512,
         activations: Optional[torch.Tensor] = None,
         gene_stats: Optional[torch.Tensor] = None,
+        codon_features: Optional[torch.Tensor] = None,
     ):
         self.labels = torch.tensor(labels, dtype=torch.long)
         self.max_length = max_length
         self.has_features = activations is not None and gene_stats is not None
+        self.has_codon = codon_features is not None
 
         if self.has_features:
             assert len(sequences) == activations.shape[0] == gene_stats.shape[0], \
@@ -47,6 +49,12 @@ class PhageContigDataset(Dataset):
                 f"acts={activations.shape[0]}, stats={gene_stats.shape[0]}"
             self.activations = activations.float()
             self.gene_stats = gene_stats.float()
+
+        if self.has_codon:
+            assert len(sequences) == codon_features.shape[0], \
+                f"Kích thước codon không khớp: seqs={len(sequences)}, " \
+                f"codon={codon_features.shape[0]}"
+            self.codon_features = codon_features.float()
 
         # Phân luồng mã hóa phân đoạn theo tổ hợp lô BATCH = 10000 chuỗi (tối ưu hóa băng thông so với cấu trúc lặp từng mẫu)
         print(f"    Trạng thái: Tiến hành mã hóa chuỗi token (Tokenizing) trên quy mô {len(sequences)} mảng...", end=" ", flush=True)
@@ -78,17 +86,21 @@ class PhageContigDataset(Dataset):
         if self.has_features:
             item['activation'] = self.activations[idx]
             item['gene_stats'] = self.gene_stats[idx]
+        if self.has_codon:
+            item['codon_features'] = self.codon_features[idx]
         return item
 
 
 def load_features(features_path: str,
                   normalize: bool = True
-                  ) -> Tuple[torch.Tensor, torch.Tensor]:
+                  ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Kích hoạt quá trình tải các đặc trưng hệ gen (gene features) đã được tính toán tiền xử lý từ các định dạng lưu điện tử _features.pt.
 
-    Cấu trúc xuất tín hiệu (Returns):
-        Bộ phân mảnh (activations [N, 26], gene_stats [N, 4]) — Bộ đôi tham số này đều trải qua bước đối chuẩn (normalized scaling).
+    Returns:
+        (activations [N, 26], gene_stats [N, 4], codon_features [N, 65] | None)
+        codon_features = None nếu file features cũ chưa có trường này
+        (backward-compat — train pipeline sẽ tự fallback).
     """
     features_path = Path(features_path)
     if not features_path.exists():
@@ -97,18 +109,31 @@ def load_features(features_path: str,
     data = torch.load(str(features_path), weights_only=False)
     activations = data["activations"].float()   # [N, 26]
     gene_stats = data["gene_stats"].float()     # [N, 4]
+    codon_features = data.get("codon_features")
+    if codon_features is not None:
+        codon_features = codon_features.float()  # [N, 65]
 
     if normalize:
-        # Z-score định biên hóa cơ sở cho bộ trọng số thống kê gen (gene_stats)
+        # Z-score gene_stats
         mean = gene_stats.mean(dim=0)
         std = gene_stats.std(dim=0).clamp(min=1e-6)
         gene_stats = (gene_stats - mean) / std
 
-        # Max-scale co giãn tối đa đối với các tập điểm hoạt hóa (Vì ma trận bit-scores HMM biên độ trải rất linh hoạt giữa các nhóm phân giải family)
+        # Max-scale activations (bit-scores HMM biến thiên rộng giữa families)
         act_max = activations.max(dim=0).values.clamp(min=1e-6)
         activations = activations / act_max
 
-    return activations, gene_stats
+        # Codon features: log-transform RSCU + z-score GC3
+        # RSCU > 0, đuôi nặng → log1p ổn định
+        if codon_features is not None:
+            rscu = torch.log1p(codon_features[:, :64])
+            gc3 = codon_features[:, 64:65]
+            gc3_mean = gc3.mean(dim=0)
+            gc3_std = gc3.std(dim=0).clamp(min=1e-6)
+            gc3 = (gc3 - gc3_mean) / gc3_std
+            codon_features = torch.cat([rscu, gc3], dim=-1)
+
+    return activations, gene_stats, codon_features
 
 
 def apply_undersampling(
@@ -116,12 +141,10 @@ def apply_undersampling(
     labels: List[int],
     activations: Optional[torch.Tensor] = None,
     gene_stats: Optional[torch.Tensor] = None,
+    codon_features: Optional[torch.Tensor] = None,
     random_state: int = 42,
 ):
-    """
-    Hàm phân giải ngẫu nhiên (Random undersampling). Sau khi hệ thống tương tác với các features cấu thành, 
-    nhóm dữ liệu này được ánh xạ và đánh chỉ số động đồng bộ hóa với định dạng sequences/labels trung tâm.
-    """
+    """Random undersampling đồng bộ chỉ số giữa sequences/labels/features."""
     X = np.arange(len(sequences)).reshape(-1, 1)
     y = np.array(labels)
     rus = RandomUnderSampler(random_state=random_state)
@@ -133,7 +156,10 @@ def apply_undersampling(
 
     if activations is not None and gene_stats is not None:
         idx_tensor = torch.tensor(indices, dtype=torch.long)
-        return new_seqs, new_labels, activations[idx_tensor], gene_stats[idx_tensor]
+        new_acts = activations[idx_tensor]
+        new_stats = gene_stats[idx_tensor]
+        new_codon = codon_features[idx_tensor] if codon_features is not None else None
+        return new_seqs, new_labels, new_acts, new_stats, new_codon
 
     return new_seqs, new_labels
 
@@ -153,17 +179,22 @@ def create_dataloaders(
 
     # Trích xuất module bộ điều hướng Features
     train_acts = train_stats = val_acts = val_stats = None
+    train_codon = val_codon = None
     if use_features:
         print(f"  Thực thi quá trình chép tải đặc trưng khối huấn luyện (training features) từ định vị trung chuyển: {train_features_path}")
-        train_acts, train_stats = load_features(train_features_path)
+        train_acts, train_stats, train_codon = load_features(train_features_path)
         print(f"  Thực thi quá trình chép tải đặc trưng mảng đối chiếu (validation features) từ định vị: {val_features_path}")
-        val_acts, val_stats = load_features(val_features_path)
+        val_acts, val_stats, val_codon = load_features(val_features_path)
+        if train_codon is None:
+            print("  [!] Codon features không có trong file features (file cũ). "
+                  "Bỏ qua codon branch — chạy lại preprocess_gene_features.py để bật.")
 
     # Chuyển đổi trạng thái dữ liệu rút gọn theo mẫu thử dưới mức thiểu số (Undersampling, độc quyền dành cho nhóm đối chứng train)
     if use_undersampling:
         if use_features:
-            train_seqs, train_labels, train_acts, train_stats = apply_undersampling(
-                train_seqs, train_labels, train_acts, train_stats, random_state,
+            train_seqs, train_labels, train_acts, train_stats, train_codon = apply_undersampling(
+                train_seqs, train_labels, train_acts, train_stats,
+                codon_features=train_codon, random_state=random_state,
             )
         else:
             train_seqs, train_labels = apply_undersampling(
@@ -179,10 +210,12 @@ def create_dataloaders(
     train_dataset = PhageContigDataset(
         train_seqs, train_labels, tokenizer, max_length,
         activations=train_acts, gene_stats=train_stats,
+        codon_features=train_codon,
     )
     val_dataset = PhageContigDataset(
         val_seqs, val_labels, tokenizer, max_length,
         activations=val_acts, gene_stats=val_stats,
+        codon_features=val_codon,
     )
 
     _extra = dict(

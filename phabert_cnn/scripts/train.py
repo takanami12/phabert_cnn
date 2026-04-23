@@ -5,6 +5,7 @@ import json
 import pickle
 import argparse
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -53,6 +54,10 @@ def parse_args():
                         help="[Ablation] tắt gene_stats concat")
     parser.add_argument("--no_pathway_scores", action="store_true",
                         help="[Ablation] tắt pathway scores")
+    parser.add_argument("--use_cross_attn", action="store_true",
+                        help="Bật FamilyCrossAttention (DNA token ↔ family token)")
+    parser.add_argument("--use_codon", action="store_true",
+                        help="Bật CodonBranch (RSCU 64 + GC3); cần features.pt mới có codon_features")
     parser.add_argument("--n_families", type=int, default=26)
 
     # --- Giai đoạn 1 (Phase 1): Tối ưu hóa sơ bộ (Warm-up) ---
@@ -140,7 +145,9 @@ class CachedEmbeddingDataset(Dataset):
         self.labels     = cache['labels']            # [N]
         self.activation = cache.get('activation')    # [N, n_families] hoặc None
         self.gene_stats = cache.get('gene_stats')    # [N, 4] hoặc None
+        self.codon      = cache.get('codon_features')  # [N, 65] hoặc None
         self.has_features = self.activation is not None
+        self.has_codon = self.codon is not None
 
     def __len__(self):
         return len(self.labels)
@@ -154,6 +161,8 @@ class CachedEmbeddingDataset(Dataset):
         if self.has_features:
             item['activation'] = self.activation[idx]
             item['gene_stats'] = self.gene_stats[idx]
+        if self.has_codon:
+            item['codon_features'] = self.codon[idx]
         return item
 
 
@@ -183,6 +192,8 @@ def extract_backbone_cache(
 
     all_h, all_mask, all_labels = [], [], []
     all_act, all_stats = ([], []) if gated else (None, None)
+    all_codon: Optional[list] = [] if gated else None
+    has_codon_seen = False
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="  Đang trích xuất"):
@@ -197,6 +208,9 @@ def extract_backbone_cache(
             if gated:
                 all_act.append(batch['activation'].cpu())
                 all_stats.append(batch['gene_stats'].cpu())
+                if 'codon_features' in batch:
+                    has_codon_seen = True
+                    all_codon.append(batch['codon_features'].cpu())
 
     cache = {
         'h_trans':        torch.cat(all_h, 0),
@@ -206,6 +220,8 @@ def extract_backbone_cache(
     if gated:
         cache['activation'] = torch.cat(all_act, 0)
         cache['gene_stats']  = torch.cat(all_stats, 0)
+        if has_codon_seen and len(all_codon) > 0:
+            cache['codon_features'] = torch.cat(all_codon, 0)
 
     size_gb = cache['h_trans'].nelement() * 2 / 1e9
     print(f"  [Cache] {len(cache['labels']):,} mẫu  "
@@ -238,13 +254,20 @@ def _forward(model: nn.Module, batch: dict, device: torch.device, gated: bool):
     attention_mask = batch['attention_mask'].to(device, non_blocking=True)
     labels         = batch['label'].to(device, non_blocking=True)
 
+    codon = batch.get('codon_features')
+    if codon is not None:
+        codon = codon.to(device, non_blocking=True)
+
     if 'h_trans' in batch:
         # ---- Chế độ cache ----
         h = batch['h_trans'].to(device, non_blocking=True)
         if gated:
             activation = batch['activation'].to(device, non_blocking=True)
             gene_stats = batch['gene_stats'].to(device, non_blocking=True)
-            logits = model.forward_head(h, attention_mask, activation, gene_stats)
+            logits = model.forward_head(
+                h, attention_mask, activation, gene_stats,
+                codon_features=codon,
+            )
         else:
             logits = model.forward_head(h, attention_mask)
     else:
@@ -258,6 +281,7 @@ def _forward(model: nn.Module, batch: dict, device: torch.device, gated: bool):
                 attention_mask=attention_mask,
                 activation_vector=activation,
                 gene_stats=gene_stats,
+                codon_features=codon,
             )
         else:
             logits = model(input_ids=input_ids, attention_mask=attention_mask)
@@ -377,6 +401,8 @@ def main():
             use_gate=not args.no_gate,
             use_gene_stats=not args.no_gene_stats,
             use_pathway_scores=not args.no_pathway_scores,
+            use_cross_attn=args.use_cross_attn,
+            use_codon=args.use_codon,
         )
     else:
         model = PhaBERTCNN(dnabert2_model_name=args.model_name)
@@ -392,9 +418,12 @@ def main():
     # ---------- Đường dẫn đầu ra ----------
     mode_suffix = "gated" if args.gated else "baseline"
     if args.gated:
-        if args.no_gate:       mode_suffix += "_nogate"
-        if args.no_gene_stats: mode_suffix += "_nostats"
-        if args.lora:          mode_suffix += "_lora"
+        if args.no_gate:           mode_suffix += "_nogate"
+        if args.no_gene_stats:     mode_suffix += "_nostats"
+        if args.no_pathway_scores: mode_suffix += "_nopath"
+        if args.use_cross_attn:    mode_suffix += "_xattn"
+        if args.use_codon:         mode_suffix += "_codon"
+        if args.lora:              mode_suffix += "_lora"
     run_dir = (Path(args.output_dir) / f"group_{args.group}"
                / f"fold_{args.fold}_{mode_suffix}")
     run_dir.mkdir(parents=True, exist_ok=True)

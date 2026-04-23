@@ -2,12 +2,106 @@ import json
 import argparse
 import warnings
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
 
 import numpy as np
 import torch
+
+
+# ============================================================
+# Codon usage constants (standard genetic code)
+# ============================================================
+
+CODON_TABLE = {
+    'TTT': 'F', 'TTC': 'F', 'TTA': 'L', 'TTG': 'L',
+    'CTT': 'L', 'CTC': 'L', 'CTA': 'L', 'CTG': 'L',
+    'ATT': 'I', 'ATC': 'I', 'ATA': 'I', 'ATG': 'M',
+    'GTT': 'V', 'GTC': 'V', 'GTA': 'V', 'GTG': 'V',
+    'TCT': 'S', 'TCC': 'S', 'TCA': 'S', 'TCG': 'S',
+    'CCT': 'P', 'CCC': 'P', 'CCA': 'P', 'CCG': 'P',
+    'ACT': 'T', 'ACC': 'T', 'ACA': 'T', 'ACG': 'T',
+    'GCT': 'A', 'GCC': 'A', 'GCA': 'A', 'GCG': 'A',
+    'TAT': 'Y', 'TAC': 'Y', 'TAA': '*', 'TAG': '*',
+    'CAT': 'H', 'CAC': 'H', 'CAA': 'Q', 'CAG': 'Q',
+    'AAT': 'N', 'AAC': 'N', 'AAA': 'K', 'AAG': 'K',
+    'GAT': 'D', 'GAC': 'D', 'GAA': 'E', 'GAG': 'E',
+    'TGT': 'C', 'TGC': 'C', 'TGA': '*', 'TGG': 'W',
+    'CGT': 'R', 'CGC': 'R', 'CGA': 'R', 'CGG': 'R',
+    'AGT': 'S', 'AGC': 'S', 'AGA': 'R', 'AGG': 'R',
+    'GGT': 'G', 'GGC': 'G', 'GGA': 'G', 'GGG': 'G',
+}
+ALL_CODONS = sorted(CODON_TABLE.keys())
+CODON_IDX = {c: i for i, c in enumerate(ALL_CODONS)}
+AA_TO_SYN: Dict[str, List[str]] = {}
+for _c, _aa in CODON_TABLE.items():
+    AA_TO_SYN.setdefault(_aa, []).append(_c)
+
+CODON_FEATURE_DIM = 65  # 64 RSCU + 1 GC3
+
+
+def compute_codon_features(cds_sequences: List[str]) -> np.ndarray:
+    """
+    Tính vector đặc trưng codon usage 65-d từ tập hợp các CDS DNA của một contig.
+
+    Cấu phần:
+      [0..63]  RSCU (Relative Synonymous Codon Usage) cho 64 codon (theo thứ tự ALL_CODONS).
+               RSCU(c) = obs(c) / (sum(obs trong nhóm synonymous của a) / N_synonymous(a))
+               Giá trị 1.0 = không thiên lệch; > 1 = ưu tiên; < 1 = né tránh.
+      [64]     GC3 — tỷ lệ G+C ở vị trí codon thứ 3 (proxy cho codon adaptation).
+
+    Khi không có codon hợp lệ → trả vector mặc định: RSCU = 1.0 (uniform), GC3 = 0.5.
+    """
+    feat = np.zeros(CODON_FEATURE_DIM, dtype=np.float32)
+    feat[:64] = 1.0
+    feat[64] = 0.5
+
+    if not cds_sequences:
+        return feat
+
+    counter: Counter = Counter()
+    third_gc = 0
+    third_total = 0
+    valid_chars = set("ACGT")
+
+    for cds in cds_sequences:
+        cds = cds.upper()
+        # Chỉ duyệt các codon đầy đủ và toàn ACGT
+        for i in range(0, len(cds) - 2, 3):
+            codon = cds[i:i + 3]
+            if len(codon) != 3:
+                continue
+            if not all(ch in valid_chars for ch in codon):
+                continue
+            counter[codon] += 1
+            third_total += 1
+            if codon[2] in ("G", "C"):
+                third_gc += 1
+
+    if sum(counter.values()) == 0:
+        return feat
+
+    # Tổng codon trong từng nhóm amino acid
+    aa_totals: Dict[str, int] = {aa: 0 for aa in AA_TO_SYN}
+    for codon, count in counter.items():
+        aa = CODON_TABLE.get(codon)
+        if aa is not None:
+            aa_totals[aa] += count
+
+    for codon, idx in CODON_IDX.items():
+        aa = CODON_TABLE[codon]
+        aa_total = aa_totals[aa]
+        n_syn = len(AA_TO_SYN[aa])
+        if aa_total > 0 and n_syn > 0:
+            expected = aa_total / n_syn
+            feat[idx] = counter[codon] / expected if expected > 0 else 1.0
+
+    if third_total > 0:
+        feat[64] = third_gc / third_total
+
+    return feat
 
 # ============================================================
 # Imports with availability checks
@@ -44,6 +138,7 @@ class GeneInfo:
     strand: int          # +1 hoặc -1
     partial: bool        # True nếu gen trải dài qua giới hạn của contig
     translation: str     # chuỗi axit amin
+    cds_seq: str = ""    # chuỗi DNA mã hóa (đã reverse-complement nếu strand = -1)
     hmm_hits: Dict[str, float] = field(default_factory=dict)  # family_name → bit-score
 
 
@@ -57,6 +152,7 @@ class ContigAnnotation:
     # Các vector đặc trưng (được điền sau tiến trình quét HMM)
     activation_vector: Optional[np.ndarray] = None   # [N_FAMILIES]
     gene_stats: Optional[np.ndarray] = None          # [4]
+    codon_features: Optional[np.ndarray] = None      # [65] (64 RSCU + 1 GC3)
 
     @property
     def gene_count(self) -> int:
@@ -95,6 +191,12 @@ class ContigAnnotation:
             self.strand_bias,
         ], dtype=np.float32)
         return self.gene_stats
+
+    def compute_codon_features(self) -> np.ndarray:
+        """Tổng hợp codon usage 65-d (64 RSCU + GC3) trên toàn bộ CDS của contig."""
+        cds_list = [g.cds_seq for g in self.genes if g.cds_seq]
+        self.codon_features = compute_codon_features(cds_list)
+        return self.codon_features
 
 
 # ============================================================
@@ -202,12 +304,21 @@ class GenePrediction:
             if len(translation) < 20:  # skip very short proteins
                 continue
 
+            # Trích xuất CDS DNA (đã reverse-complement nếu strand = -1) cho codon
+            try:
+                dna_cds = sequence[gene.begin - 1 : gene.end]
+                if gene.strand == -1:
+                    dna_cds = str(Seq(dna_cds).reverse_complement())
+            except Exception:
+                dna_cds = ""
+
             genes.append(GeneInfo(
                 start=gene.begin,
                 end=gene.end,
                 strand=1 if gene.strand == 1 else -1,
                 partial=gene.partial_begin or gene.partial_end,
                 translation=translation,
+                cds_seq=dna_cds,
             ))
 
         return ContigAnnotation(
@@ -438,9 +549,13 @@ def process_fasta(
 
         # Skip very short sequences
         if len(sequence) < 30:
+            zero_codon = np.zeros(CODON_FEATURE_DIM, dtype=np.float32)
+            zero_codon[:64] = 1.0
+            zero_codon[64] = 0.5
             results[contig_id] = {
                 "activation": np.zeros(n_families, dtype=np.float32),
                 "gene_stats": np.zeros(4, dtype=np.float32),
+                "codon_features": zero_codon,
                 "n_genes": 0,
                 "gene_details": [],
             }
@@ -460,8 +575,9 @@ def process_fasta(
         else:
             annotation.activation_vector = np.zeros(n_families, dtype=np.float32)
 
-        # Step 3: Compute gene statistics
+        # Step 3: Compute gene statistics + codon usage
         annotation.compute_gene_stats()
+        annotation.compute_codon_features()
 
         # Package results
         gene_details = []
@@ -478,6 +594,7 @@ def process_fasta(
         results[contig_id] = {
             "activation": annotation.activation_vector,
             "gene_stats": annotation.gene_stats,
+            "codon_features": annotation.codon_features,
             "n_genes": annotation.gene_count,
             "gene_details": gene_details,
         }
@@ -537,9 +654,13 @@ def process_pkl(
 
         # Very short sequences → zero features
         if len(sequence) < 30:
+            zero_codon = np.zeros(CODON_FEATURE_DIM, dtype=np.float32)
+            zero_codon[:64] = 1.0
+            zero_codon[64] = 0.5
             results.append({
                 "activation": np.zeros(n_families, dtype=np.float32),
                 "gene_stats": np.zeros(4, dtype=np.float32),
+                "codon_features": zero_codon,
                 "n_genes": 0,
             })
             continue
@@ -559,12 +680,14 @@ def process_pkl(
         else:
             annotation.activation_vector = np.zeros(n_families, dtype=np.float32)
 
-        # Step 3: Gene statistics
+        # Step 3: Gene statistics + codon usage
         annotation.compute_gene_stats()
+        annotation.compute_codon_features()
 
         results.append({
             "activation": annotation.activation_vector,
             "gene_stats": annotation.gene_stats,
+            "codon_features": annotation.codon_features,
             "n_genes": annotation.gene_count,
         })
 
@@ -603,18 +726,26 @@ def save_results_from_pkl(results: List[dict], output_path: str, n_families: int
     n = len(results)
     activations = np.zeros((n, n_families), dtype=np.float32)
     gene_stats  = np.zeros((n, 4), dtype=np.float32)
+    codon_features = np.zeros((n, CODON_FEATURE_DIM), dtype=np.float32)
     n_genes_arr = np.zeros(n, dtype=np.int64)
 
     for i, r in enumerate(results):
         activations[i] = r["activation"]
         gene_stats[i]  = r["gene_stats"]
+        codon_features[i] = r.get(
+            "codon_features",
+            np.concatenate([np.ones(64, dtype=np.float32),
+                            np.array([0.5], dtype=np.float32)]),
+        )
         n_genes_arr[i] = r["n_genes"]
 
     data = {
         "activations": torch.from_numpy(activations),
         "gene_stats":  torch.from_numpy(gene_stats),
+        "codon_features": torch.from_numpy(codon_features),
         "n_genes":     torch.from_numpy(n_genes_arr),
         "n_families":  n_families,
+        "codon_feature_dim": CODON_FEATURE_DIM,
     }
 
     output_path = Path(output_path)
@@ -650,13 +781,19 @@ def save_results(results: Dict[str, dict], output_path: str, n_families: int):
 
     activations = np.zeros((n, n_families), dtype=np.float32)
     gene_stats  = np.zeros((n, 4), dtype=np.float32)
+    codon_features = np.zeros((n, CODON_FEATURE_DIM), dtype=np.float32)
     n_genes_arr = np.zeros(n, dtype=np.int64)
     gene_details = {}
+
+    default_codon = np.concatenate(
+        [np.ones(64, dtype=np.float32), np.array([0.5], dtype=np.float32)]
+    )
 
     for i, cid in enumerate(contig_ids):
         r = results[cid]
         activations[i] = r["activation"]
         gene_stats[i]  = r["gene_stats"]
+        codon_features[i] = r.get("codon_features", default_codon)
         n_genes_arr[i] = r["n_genes"]
         gene_details[cid] = r["gene_details"]
 
@@ -664,9 +801,11 @@ def save_results(results: Dict[str, dict], output_path: str, n_families: int):
         "contig_ids": contig_ids,
         "activations": torch.from_numpy(activations),
         "gene_stats":  torch.from_numpy(gene_stats),
+        "codon_features": torch.from_numpy(codon_features),
         "n_genes":     torch.from_numpy(n_genes_arr),
         "gene_details": gene_details,
         "n_families":  n_families,
+        "codon_feature_dim": CODON_FEATURE_DIM,
     }
 
     output_path = Path(output_path)

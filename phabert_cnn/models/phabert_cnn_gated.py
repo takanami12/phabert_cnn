@@ -1,3 +1,39 @@
+"""
+PhaBERT-CNN — Phiên bản v3 (Multi-modal Fusion).
+
+So với phiên bản trước (global sigmoid gate + hand-crafted pathway buckets),
+phiên bản này khắc phục các vấn đề kiến trúc đã được xác định:
+
+  1. Global gate broadcast cùng vector cho mọi token → không có khả năng
+     modulate per-position. Thay bằng **FiLM** (Feature-wise Linear Modulation)
+     init = identity (gate=0, bias=0) để day-1 không vỡ phân phối backbone.
+
+  2. PathwayScoreLayer hand-crafted bucket (max-pool tĩnh) → mất khả năng học,
+     scale bit-score thô không norm. Thay bằng **LearnableFamilyAggregator**:
+     family embeddings + Transformer encoder + attention pooling, có mask
+     những family activation = 0.
+
+  3. activation_vector thô (bit-scores HMM) đưa thẳng vào MLP gate → MLP thấy
+     thang lệch giữa các family. Thay bằng **ActivationEncoder** (log1p +
+     LayerNorm + MLP) → biểu diễn ổn định hơn, kết hợp cùng gene_stats thành
+     một vector điều kiện chung `z_cond`.
+
+  4. (Tùy chọn) **FamilyCrossAttention**: coi mỗi family là một token, DNA
+     token query qua family token. Cung cấp tín hiệu gen ở mức per-position
+     thay vì chỉ global. Init residual scale = 0 → identity day-1.
+
+Khuôn khổ tổng quát:
+  z_cond = ActivationEncoder(activation_vector, gene_stats)   # [B, d_cond]
+  h0 = DNABERT-2(input_ids)                                   # [B, L, 768]
+  h1 = FiLM(h0, z_cond)                                       # FiLM-modulated
+  h2 = (FamilyCrossAttention(h1, activation_vector) if use_cross_attn else h1)
+  cnn_out  = MultiScaleCNN(h2)                                # [B, 384]
+  attn_out = AttentionPooling(h2) → projection                # [B, 128]
+  fam_agg  = LearnableFamilyAggregator(activation_vector)     # [B, d_fam]
+  combined = cat([cnn_out, attn_out, gene_stats_norm, fam_agg])
+  logits = Classifier(combined)
+"""
+
 from typing import Optional
 
 import torch
@@ -9,148 +45,272 @@ from .phabert_cnn import MultiScaleCNNBranch, _replace_flash_attn
 from .attention import AttentionPooling
 
 
-class PathwayScoreLayer(nn.Module):
+# ============================================================
+# Khối điều kiện (Conditioning blocks)
+# ============================================================
+
+
+class ActivationEncoder(nn.Module):
     """
-    Tính toán chỉ số định hướng con đường sinh học (biological pathway scores) dựa trên vector đặc trưng hoạt hóa (activation) nhóm gen.
+    Encoder vector kích hoạt HMM + gene_stats → vector điều kiện chung.
 
-    Lược đồ phân rã con đường sinh lý (pathway index → mô tả danh mục):
-        0  exclusive_lysogenic  [0, 1, 2, 8, 25]   Mã hóa nhóm men integrase/excisionase/imm (đặc trưng dung giải độc quyền)
-        1  lysogeny_regulatory  [3, 24]            Nhóm yếu tố kìm hãm CI repressor (yêu cầu đồng thời hai tín hiệu hit)
-        2  plasmid_lysogenic    [6, 7]             Hệ thống phân vùng (ParA/ParB)
-        3  lytic_regulatory     [4, 9]             Yếu tố điều hòa lytic (Cro / antirepressor)
-        4  shared_lysis         [12, 13, 14, 15]   Phức hợp dung giải (holin/endolysin/spanin)
-        5  shared_structural    [16..23]           Cấu trúc phân tử (virion assembly gene)
+    Pipeline:
+        activation [B, N]
+            → log1p (ổn định bit-score đuôi nặng)
+            → LayerNorm per-family
+            → concat với gene_stats (đã norm bên ngoài hoặc identity nếu None)
+            → MLP (GELU + LayerNorm + Linear)
+            → vector điều kiện [B, d_cond]
     """
 
-    N_PATHWAYS = 6
-
-    _PATHWAY_DEF = [
-        ("exclusive_lysogenic", [0, 1, 2, 8, 25]),
-        ("lysogeny_regulatory", [3, 24]),
-        ("plasmid_lysogenic",   [6, 7]),
-        ("lytic_regulatory",    [4, 9]),
-        ("shared_lysis",        [12, 13, 14, 15]),
-        ("shared_structural",   [16, 17, 18, 19, 20, 21, 22, 23]),
-    ]
-
-    def __init__(self, n_families: int = 26):
+    def __init__(self, n_families: int = 26, n_gene_stats: int = 4,
+                 d_cond: int = 256, hidden_dim: int = 256,
+                 use_gene_stats: bool = True):
         super().__init__()
-        for name, indices in self._PATHWAY_DEF:
-            valid = [i for i in indices if i < n_families]
-            self.register_buffer(
-                f"_idx_{name}",
-                torch.tensor(valid, dtype=torch.long),
-            )
+        self.n_families = n_families
+        self.n_gene_stats = n_gene_stats
+        self.use_gene_stats = use_gene_stats
+
+        self.act_norm = nn.LayerNorm(n_families)
+        in_dim = n_families + (n_gene_stats if use_gene_stats else 0)
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, d_cond)
+        self.norm2 = nn.LayerNorm(d_cond)
+
+    def forward(self, activation: Optional[torch.Tensor],
+                gene_stats: Optional[torch.Tensor],
+                batch_size: int, device, dtype) -> torch.Tensor:
+        if activation is None:
+            activation = torch.zeros(batch_size, self.n_families,
+                                     device=device, dtype=dtype)
+        # log1p ổn định cho bit-score (không âm sau khi normalize-max)
+        z = torch.log1p(activation.clamp(min=0.0))
+        z = self.act_norm(z)
+        if self.use_gene_stats:
+            if gene_stats is None:
+                gene_stats = torch.zeros(batch_size, self.n_gene_stats,
+                                         device=device, dtype=dtype)
+            z = torch.cat([z, gene_stats], dim=-1)
+        h = self.fc1(z)
+        h = self.norm1(h)
+        h = self.act(h)
+        h = self.fc2(h)
+        h = self.norm2(h)
+        return h  # [B, d_cond]
+
+
+class FiLM(nn.Module):
+    """
+    Feature-wise Linear Modulation (Perez et al. 2018).
+
+        h_film = h * (1 + gamma(z)) + beta(z)
+
+    Init: gamma.weight = gamma.bias = beta.weight = beta.bias = 0
+        → gamma(z) = beta(z) = 0
+        → h_film = h (identity day-1, KHÔNG vỡ phân phối backbone).
+
+    So với global sigmoid gate cũ:
+        - Per-token modulation (broadcast theo chiều L tự nhiên).
+        - Có thêm bias term beta → modulate cả vị trí lẫn scale.
+        - Init đúng identity (sigmoid init = 0.5 không phải 0).
+    """
+
+    def __init__(self, cond_dim: int, feat_dim: int):
+        super().__init__()
+        self.gamma = nn.Linear(cond_dim, feat_dim)
+        self.beta = nn.Linear(cond_dim, feat_dim)
+        nn.init.zeros_(self.gamma.weight)
+        nn.init.zeros_(self.gamma.bias)
+        nn.init.zeros_(self.beta.weight)
+        nn.init.zeros_(self.beta.bias)
+
+    def forward(self, h: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        # h: [B, L, D], z: [B, C]
+        gamma = self.gamma(z).unsqueeze(1)  # [B, 1, D]
+        beta = self.beta(z).unsqueeze(1)    # [B, 1, D]
+        return h * (1.0 + gamma) + beta
+
+
+class FamilyCrossAttention(nn.Module):
+    """
+    Cross-attention: DNA tokens (query) ⇄ family tokens (key/value).
+
+    Mỗi family được biểu diễn như một token = embedding học được + scale theo
+    bit-score activation. Family activation = 0 bị mask khỏi attention.
+
+    Output:  h + scale * attn_out   với `scale` là parameter init = 0
+        → identity day-1, tránh vỡ phân phối backbone trước khi học.
+    """
+
+    def __init__(self, n_families: int = 26, d_model: int = 768,
+                 n_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.n_families = n_families
+        self.fam_emb = nn.Embedding(n_families, d_model)
+        self.act_proj = nn.Linear(1, d_model)
+        nn.init.zeros_(self.act_proj.weight)
+        nn.init.zeros_(self.act_proj.bias)
+        self.attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True,
+        )
+        # Learnable residual scale init = 0 → identity day-1
+        self.residual_scale = nn.Parameter(torch.zeros(1))
+
+    def forward(self, h: torch.Tensor,
+                activation: Optional[torch.Tensor]) -> torch.Tensor:
+        if activation is None:
+            return h
+        B = h.size(0)
+        # Family tokens = embedding + activation-modulated bias
+        fam_tokens = self.fam_emb.weight.unsqueeze(0).expand(B, -1, -1)
+        fam_tokens = fam_tokens + self.act_proj(activation.unsqueeze(-1))
+        # Mask family với activation ≈ 0 (không có hit HMM)
+        key_padding_mask = (activation.abs() < 1e-6)  # [B, N]
+        # Nếu cả batch toàn-zero (edge case), tránh NaN softmax bằng skip
+        if key_padding_mask.all():
+            return h
+        attn_out, _ = self.attn(
+            query=h, key=fam_tokens, value=fam_tokens,
+            key_padding_mask=key_padding_mask, need_weights=False,
+        )
+        return h + self.residual_scale * attn_out
+
+
+class CodonBranch(nn.Module):
+    """
+    Encoder cho codon usage features (RSCU 64-d log-transformed + GC3 z-scored).
+
+    Output: vector [B, d_out] để concat tại classifier.
+
+    Lý do: lytic vs temperate khác biệt về codon adaptation index (lytic có
+    xu hướng dùng codon gần host hơn để replicate nhanh). Tín hiệu này hoàn
+    toàn độc lập với HMM activation và DNA n-gram của DNABERT-2.
+    """
+
+    def __init__(self, codon_dim: int = 65, hidden_dim: int = 128,
+                 d_out: int = 64, dropout: float = 0.1):
+        super().__init__()
+        self.input_norm = nn.LayerNorm(codon_dim)
+        self.fc1 = nn.Linear(codon_dim, hidden_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim, d_out)
+        self.out_norm = nn.LayerNorm(d_out)
+
+    def forward(self, codon_features: torch.Tensor) -> torch.Tensor:
+        h = self.input_norm(codon_features)
+        h = self.fc1(h)
+        h = self.norm1(h)
+        h = self.act(h)
+        h = self.dropout(h)
+        h = self.fc2(h)
+        return self.out_norm(h)
+
+
+class LearnableFamilyAggregator(nn.Module):
+    """
+    Bộ tổng hợp họ gen có khả năng học, thay thế PathwayScoreLayer (hand-crafted).
+
+    Mỗi family được biểu diễn = (family embedding học được, augmented với
+    activation magnitude). Một Transformer encoder 1-tầng cho phép các family
+    "nói chuyện" với nhau (mô hình hóa pathway implicitly), sau đó attention
+    pooling trả về một vector pathway-aware [B, d_out].
+
+    Family với activation = 0 bị mask để tránh nhiễu vào pooling.
+    """
+
+    def __init__(self, n_families: int = 26, d_emb: int = 64, d_out: int = 32,
+                 n_heads: int = 4, n_layers: int = 1, dropout: float = 0.1):
+        super().__init__()
+        self.n_families = n_families
+        self.fam_emb = nn.Embedding(n_families, d_emb)
+        self.in_proj = nn.Linear(d_emb + 1, d_emb)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_emb, nhead=n_heads, dim_feedforward=d_emb * 4,
+            dropout=dropout, batch_first=True, activation="gelu",
+        )
+        self.set_enc = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.pool_score = nn.Linear(d_emb, 1)
+        self.out_proj = nn.Linear(d_emb, d_out)
+        self.out_norm = nn.LayerNorm(d_out)
 
     def forward(self, activation: torch.Tensor) -> torch.Tensor:
-        """
-        Tham số đầu vào (Args):
-            activation: [B, N_FAMILIES] — Điểm kiểm tra dạng chu Bit (HMM bit-scores) đã qua bước chuẩn hóa chuẩn.
+        B = activation.size(0)
+        fam = self.fam_emb.weight.unsqueeze(0).expand(B, -1, -1)  # [B, N, d]
+        fam_aug = torch.cat([fam, activation.unsqueeze(-1)], dim=-1)
+        x = self.in_proj(fam_aug)                                 # [B, N, d]
+        mask = (activation.abs() < 1e-6)                          # [B, N]
+        # Edge case: toàn bộ batch không có hit nào → encoder + softmax trên
+        # mask toàn True sẽ NaN. Fallback: trả zeros.
+        if mask.all():
+            return torch.zeros(B, self.out_proj.out_features,
+                               device=activation.device, dtype=activation.dtype)
+        x = self.set_enc(x, src_key_padding_mask=mask)            # [B, N, d]
+        scores = self.pool_score(x).squeeze(-1)                   # [B, N]
+        scores = scores.masked_fill(mask, float("-inf"))
+        # Per-row: nếu hàng nào toàn -inf, gán uniform để tránh NaN
+        all_masked_rows = mask.all(dim=-1)
+        if all_masked_rows.any():
+            scores[all_masked_rows] = 0.0
+        weights = torch.softmax(scores, dim=-1).unsqueeze(-1)     # [B, N, 1]
+        agg = (weights * x).sum(dim=1)                            # [B, d]
+        out = self.out_proj(agg)
+        out = self.out_norm(out)
+        return out  # [B, d_out]
 
-        Cấu trúc trả về (Returns):
-            pathway_scores: [B, 6] — Ma trận trọng số tương quan theo 6 con đường sinh học.
-        """
-        scores = []
-        for name, _ in self._PATHWAY_DEF:
-            idx = getattr(self, f"_idx_{name}")
-            if idx.numel() > 0:
-                score = activation[:, idx].max(dim=1).values
-            else:
-                score = torch.zeros(
-                    activation.size(0),
-                    device=activation.device,
-                    dtype=activation.dtype,
-                )
-            scores.append(score)
-        return torch.stack(scores, dim=1)   # [B, 6]
 
-
-class GeneGateMLP(nn.Module):
-    """
-    Khối tính toán phi tuyến tính thực hiện phép nội suy từ vector đặc trưng gen (activation vector) thành vector kiểm soát ngưỡng (gate vector) theo từng chiều cụ thể.
-
-    Định dạng dữ liệu:
-        Đầu vào:  activation_vector [B, N_FAMILIES]
-        Đầu ra:   gate vector       [B, 768] (Bị giới hạn không gian miền giá trị [0, 1] qua hàm Sigmoid)
-
-    Quy hoạch kiến trúc: Theo nguyên lý cổ chai (bottleneck design) nhằm cực tiểu hóa tổng lượng tham số học máy.
-        N_FAMILIES → Điểm chạm nội suy 128 → Ngõ ra 768
-    """
-
-    def __init__(self, n_families: int = 24, hidden_dim: int = 128,
-                 output_dim: int = 768):
-        super().__init__()
-        self.input_norm = nn.LayerNorm(n_families)
-        self.fc1 = nn.Linear(n_families, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-        self.activation = nn.ReLU(inplace=True)
-        self.layer_norm = nn.LayerNorm(hidden_dim)
-
-        # Identity init: weight + bias = 0 → fc2 output = 0 → tanh(0) = 0.
-        # Kết hợp với h_gated = h_trans + h_trans * gate ở forward chính
-        # → gate=0 day-1 → h_gated = h_trans (giữ nguyên phân phối backbone).
-        nn.init.zeros_(self.fc2.weight)
-        nn.init.zeros_(self.fc2.bias)
-
-    def forward(self, activation_vector: torch.Tensor) -> torch.Tensor:
-        """
-        Tham số (Args):
-            activation_vector: [B, N_FAMILIES]
-
-        Kết quả (Returns):
-            gate: Ngõ ra cấp tín hiệu gating [B, 768], miền giá trị [-1, 1] (tanh).
-        """
-        h = self.input_norm(activation_vector)
-        h = self.fc1(h)
-        h = self.layer_norm(h)
-        h = self.activation(h)
-        h = self.fc2(h)
-        return torch.tanh(h)
+# ============================================================
+# Mô hình chính
+# ============================================================
 
 
 class PhaBERTCNN_GeneGated(nn.Module):
     """
-    Kiến trúc mở rộng PhaBERT-CNN tích hợp cổng điều hướng tín hiệu đặc trưng gen (gene gating), số liệu cấu trúc thống kê (gene statistics) và đánh giá lộ trình chức năng sinh học (pathway scores).
+    PhaBERT-CNN multi-modal v3.
 
-    Khuôn khổ hoạt động:
-        1. Base mô hình lõi DNABERT-2         → h_trans [B, L, 768]
-        2. Kênh tín hiệu cổng gen (chuẩn tiêm dữ liệu thặng dư - residual injection):
-               g = GeneGateMLP(activation_vector)  # tanh, init=0 → identity day-1
-               h_gated = h_trans + h_trans * g.unsqueeze(1)
-        3. CNN đa tầng hoạt động trên h_gated → cnn_out [B, 384]
-        4. Tích hợp chú ý (Attention) từ h_gated→ global_out [B, 128]
-        5. Phối hợp yếu tố gene_stats (LayerNorm) → combined [B, 516]
-        6. Trọng số lộ trình (LayerNorm)      → combined [B, 522]
-        7. Không gian quyết định (Classifier) → logits [B, 2]
-
-    Cấu hình đầu vào quy trình phân lớp cuối:
-        384 (Đặc trưng định hướng CNN) + 128 (Chú ý Toàn cục - Attn) + 4 (Đặc tính Gen - Stats) + 6 (Biểu thị Pathway) = Tổng kích thước 522 chiều phân loại.
+    Args (giữ tương thích cờ ablation cũ):
+        use_gate:           Bật FiLM modulation (thay global sigmoid gate cũ).
+        use_gene_stats:     Đưa gene_stats vào ActivationEncoder + concat classifier.
+        use_pathway_scores: Bật LearnableFamilyAggregator (thay PathwayScoreLayer cũ).
+        use_cross_attn:     (Mới) Bật FamilyCrossAttention DNA↔family.
     """
 
     def __init__(
         self,
         dnabert2_model_name: str = "zhihan1996/DNABERT-2-117M",
         n_families: int = 26,
-        gate_hidden_dim: int = 128,
         n_gene_stats: int = 4,
+        codon_dim: int = 65,
         use_gate: bool = True,
         use_gene_stats: bool = True,
         use_pathway_scores: bool = True,
+        use_cross_attn: bool = False,
+        use_codon: bool = False,
         embedding_dim: int = 768,
         cnn_out_dim: int = 384,
         global_out_dim: int = 128,
+        cond_dim: int = 256,
+        family_agg_dim: int = 32,
+        codon_out_dim: int = 64,
+        cross_attn_heads: int = 4,
         num_classes: int = 2,
     ):
         super().__init__()
         self.use_gate = use_gate
         self.use_gene_stats = use_gene_stats
         self.use_pathway_scores = use_pathway_scores
+        self.use_cross_attn = use_cross_attn
+        self.use_codon = use_codon
         self.embedding_dim = embedding_dim
         self.n_families = n_families
+        self.n_gene_stats = n_gene_stats
+        self.codon_dim = codon_dim
+        self.codon_out_dim = codon_out_dim
 
-        # --- Khối Kiến Trúc Nền (Backbone) ---
-        # Khởi xuất DNABERT-2 thông qua dynamic module class (giải quyết triệt để rủi ro xung đột đăng ký - registry conflict trong họ hàm AutoModel).
-        # Đồng nhất cơ chế kỹ thuật gọi gốc (load backbone) của cấu trúc PhaBERTCNN tiêu chuẩn trong mục models/phabert_cnn.py.
+        # --- Backbone DNABERT-2 ---
         _revision = "7bce263b15377fc15361f52cfab88f8b586abda0"
 
         config = BertConfig.from_pretrained(
@@ -158,7 +318,6 @@ class PhaBERTCNN_GeneGated(nn.Module):
         )
         if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
             config.pad_token_id = 0
-        # Tạm vô hiệu thuật toán bộ nhớ flash attention (nhằm duy trì ổn định hệ thống qua khả năng tương thích của môi trường Triton bản phân phối chuẩn)
         config.use_flash_attn = False
 
         model_cls = get_class_from_dynamic_module(
@@ -189,55 +348,150 @@ class PhaBERTCNN_GeneGated(nn.Module):
         _BertEncoder.rebuild_alibi_tensor = _orig_rebuild
         self.backbone.encoder.rebuild_alibi_tensor(size=config.alibi_starting_size)
 
-        # --- Cơ chế chốt kiểm soát gen (Giao thức tiêm dữ liệu Injection 1) ---
-        if self.use_gate:
-            self.gene_gate = GeneGateMLP(
+        # --- Conditioning encoder (activation + gene_stats → z_cond) ---
+        # Cần khi bất kỳ một trong các injection (gate / cross-attn) bật.
+        if self.use_gate or self.use_cross_attn:
+            self.cond_encoder = ActivationEncoder(
                 n_families=n_families,
-                hidden_dim=gate_hidden_dim,
-                output_dim=embedding_dim,
+                n_gene_stats=n_gene_stats,
+                d_cond=cond_dim,
+                hidden_dim=cond_dim,
+                use_gene_stats=use_gene_stats,
             )
 
-        # --- Mô hình các cấu trúc chuỗi phân lớp CNN mở rộng (Kế thừa nền tảng baseline) ---
+        # --- FiLM injection (thay global gate) ---
+        if self.use_gate:
+            self.film = FiLM(cond_dim=cond_dim, feat_dim=embedding_dim)
+
+        # --- Family cross-attention (per-token gene injection, optional) ---
+        if self.use_cross_attn:
+            self.cross_attn = FamilyCrossAttention(
+                n_families=n_families, d_model=embedding_dim,
+                n_heads=cross_attn_heads,
+            )
+
+        # --- CNN multi-scale (kế thừa) ---
         self.cnn_branches = nn.ModuleList([
             MultiScaleCNNBranch(embedding_dim, kernel_size=k)
             for k in (3, 5, 7)
         ])
 
-        # --- Trích xuất tính chất tập trung bằng Attention pooling (Kế thừa nền tảng baseline) ---
+        # --- Attention pooling toàn cục (kế thừa) ---
         self.attention_pooling = AttentionPooling(embedding_dim)
         self.global_projection = nn.Sequential(
             nn.Linear(embedding_dim, global_out_dim),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Dropout(0.1),
         )
 
-        # --- Giai đoạn lọc đặc tính chuyên môn Pathway score layer (Giao thức tiền giả thiết Inject 3, cơ chế tĩnh không khả huấn) ---
+        # --- Learnable family aggregator (thay PathwayScoreLayer) ---
         if self.use_pathway_scores:
-            self.pathway_score_layer = PathwayScoreLayer(n_families=n_families)
-            # Bit-scores HMM thô có biên độ rộng (10–100) → norm về cùng scale
-            # với feature NN trước khi concat vào classifier.
-            self.pathway_norm = nn.LayerNorm(PathwayScoreLayer.N_PATHWAYS)
+            self.family_aggregator = LearnableFamilyAggregator(
+                n_families=n_families, d_emb=64, d_out=family_agg_dim,
+            )
 
-        # Norm gene_stats riêng (count/density/coding_frac/strand_bias khác scale)
+        # --- Norm cho gene_stats trước concat classifier ---
         if self.use_gene_stats:
             self.gene_stats_norm = nn.LayerNorm(n_gene_stats)
 
-        # --- Trạm quyết định (Classifier) ---
-        # Tổng hòa đầu vào: 384 (mạch CNN) + 128 (mạch attn) = chuẩn hóa 512 chiểu
-        # Nếu điều hướng kích hoạt use_gene_stats:         Bổ sung 4 → Mức 516
-        # Nếu điều hướng kích hoạt use_pathway_scores:     Bổ sung 6 → Mức 522
-        classifier_in = cnn_out_dim + global_out_dim  # Chiều ban đầu 512
+        # --- Codon usage branch ---
+        if self.use_codon:
+            self.codon_branch = CodonBranch(
+                codon_dim=codon_dim, hidden_dim=128, d_out=codon_out_dim,
+            )
+
+        # --- Classifier ---
+        classifier_in = cnn_out_dim + global_out_dim                # 512
         if self.use_gene_stats:
-            classifier_in += n_gene_stats              # +4
+            classifier_in += n_gene_stats                            # +4
         if self.use_pathway_scores:
-            classifier_in += PathwayScoreLayer.N_PATHWAYS  # +6
+            classifier_in += family_agg_dim                          # +32
+        if self.use_codon:
+            classifier_in += codon_out_dim                           # +64
         self.classifier = nn.Sequential(
             nn.LayerNorm(classifier_in),
-            nn.Linear(classifier_in, 128),
-            nn.ReLU(inplace=True),
+            nn.Linear(classifier_in, 256),
+            nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(128, num_classes),
+            nn.Linear(256, num_classes),
         )
+
+    # ============================================================
+    # Trục xử lý chính
+    # ============================================================
+
+    def _condition(self, activation_vector: Optional[torch.Tensor],
+                   gene_stats: Optional[torch.Tensor],
+                   batch_size: int, device, dtype) -> Optional[torch.Tensor]:
+        """Tạo vector điều kiện z_cond từ activation + gene_stats."""
+        if not (self.use_gate or self.use_cross_attn):
+            return None
+        return self.cond_encoder(
+            activation_vector, gene_stats, batch_size, device, dtype,
+        )
+
+    def _apply_injections(self, h_trans: torch.Tensor,
+                          attention_mask: torch.Tensor,
+                          activation_vector: Optional[torch.Tensor],
+                          gene_stats: Optional[torch.Tensor]) -> torch.Tensor:
+        """Áp FiLM + cross-attn lên h_trans."""
+        B = h_trans.size(0)
+        device, dtype = h_trans.device, h_trans.dtype
+        z_cond = self._condition(
+            activation_vector, gene_stats, B, device, dtype,
+        )
+        h = h_trans
+        if self.use_gate:
+            h = self.film(h, z_cond)
+        if self.use_cross_attn:
+            h = self.cross_attn(h, activation_vector)
+        return h
+
+    def _classify(self, h: torch.Tensor, attention_mask: torch.Tensor,
+                  activation_vector: Optional[torch.Tensor],
+                  gene_stats: Optional[torch.Tensor],
+                  codon_features: Optional[torch.Tensor]) -> torch.Tensor:
+        """Pipeline CNN + Attention pooling + family aggregator + codon + classifier."""
+        # CNN branches
+        cnn_input = h.transpose(1, 2)
+        cnn_feats = [branch(cnn_input) for branch in self.cnn_branches]
+        cnn_out = torch.cat(cnn_feats, dim=-1)                    # [B, 384]
+
+        # Attention pooling
+        context_vector, _ = self.attention_pooling(h, attention_mask)
+        global_out = self.global_projection(context_vector)        # [B, 128]
+
+        combined = torch.cat([cnn_out, global_out], dim=-1)        # [B, 512]
+        B = combined.size(0)
+        device, dtype = combined.device, combined.dtype
+
+        # gene_stats (norm + concat)
+        if self.use_gene_stats:
+            stats = gene_stats if gene_stats is not None else torch.zeros(
+                B, self.n_gene_stats, device=device, dtype=dtype,
+            )
+            stats = self.gene_stats_norm(stats)
+            combined = torch.cat([combined, stats], dim=-1)
+
+        # Learnable family aggregator
+        if self.use_pathway_scores:
+            act = activation_vector if activation_vector is not None else torch.zeros(
+                B, self.n_families, device=device, dtype=dtype,
+            )
+            fam_agg = self.family_aggregator(act)
+            combined = torch.cat([combined, fam_agg], dim=-1)
+
+        # Codon branch
+        if self.use_codon:
+            if codon_features is None:
+                # Default: RSCU = 0 sau log1p (= 1.0 RSCU thô uniform), GC3 = 0 sau norm
+                codon_features = torch.zeros(
+                    B, self.codon_dim, device=device, dtype=dtype,
+                )
+            codon_out = self.codon_branch(codon_features)
+            combined = torch.cat([combined, codon_out], dim=-1)
+
+        return self.classifier(combined)
 
     def forward(
         self,
@@ -245,73 +499,21 @@ class PhaBERTCNN_GeneGated(nn.Module):
         attention_mask: torch.Tensor,
         activation_vector: Optional[torch.Tensor] = None,
         gene_stats: Optional[torch.Tensor] = None,
+        codon_features: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Giao thức tính suy theo hướng tiến.
-
-        Tham số điều kiện (Args):
-            input_ids:         Dạng [B, L]
-            attention_mask:    Dạng [B, L]
-            activation_vector: Dạng [B, N_FAMILIES] — Ma trận trọng lượng phân giải bit (HMM bit-scores) tiệm cận chuẩn.
-            gene_stats:        Dạng [B, 4]          — (Khai báo mẫu: số lượng count, mật độ density, khoảng mã hóa coding_frac, sự chênh lệch chuỗi mã strand_bias)
-
-        Kết quả phản hồi (Returns):
-            logits:            Dạng [B, num_classes]
-        """
-        # Bước 1: Trạm gốc DNABERT-2 tiến hành trích xuất phổ dữ liệu thô
         backbone_outputs = self.backbone(
             input_ids=input_ids, attention_mask=attention_mask,
         )
         if isinstance(backbone_outputs, tuple):
             h_trans = backbone_outputs[0]
         else:
-            h_trans = backbone_outputs.last_hidden_state      # [B, L, 768]
+            h_trans = backbone_outputs.last_hidden_state          # [B, L, 768]
 
-        # Bước 2: Kích hoạt màng lọc Cổng gen (Cơ chế Inject 1 — Hiệu chỉnh đường truyền qua tích hợp thặng dư residual)
-        if self.use_gate:
-            if activation_vector is None:
-                gate = torch.zeros(
-                    h_trans.size(0), self.embedding_dim,
-                    device=h_trans.device, dtype=h_trans.dtype,
-                )
-            else:
-                gate = self.gene_gate(activation_vector)      # [B, 768]
-            h_gated = h_trans + h_trans * gate.unsqueeze(1)   # [B, L, 768]
-        else:
-            h_gated = h_trans
-
-        # Bước 3: Đưa đặc tính thô qua cấu trúc phân tán đa tầng CNN
-        cnn_input = h_gated.transpose(1, 2)                   # [B, 768, L]
-        cnn_features = [branch(cnn_input) for branch in self.cnn_branches]
-        cnn_out = torch.cat(cnn_features, dim=-1)             # [B, 384]
-
-        # Bước 4: Thiết định trọng lượng tầm soát bao trùm nhờ Attention pooling
-        context_vector, _ = self.attention_pooling(h_gated, attention_mask)
-        global_out = self.global_projection(context_vector)   # [B, 128]
-
-        # Bước 5: Kết nạp chuỗi tham số thực thể từ hệ thống gene_stats (Cơ chế Inject 2)
-        combined = torch.cat([cnn_out, global_out], dim=-1)   # [B, 512]
-        if self.use_gene_stats:
-            stats = gene_stats if gene_stats is not None else torch.zeros(
-                combined.size(0), 4,
-                device=combined.device, dtype=combined.dtype,
-            )
-            stats = self.gene_stats_norm(stats)
-            combined = torch.cat([combined, stats], dim=-1)   # [B, 516]
-
-        # Bước 6: Tập hợp thông số chuẩn đích ngắm (Pathway scores - Cơ chế Inject 3 — Khảo sát tĩnh không tham gia mạng hội tụ trainable)
-        if self.use_pathway_scores:
-            act = activation_vector if activation_vector is not None else torch.zeros(
-                combined.size(0), self.n_families,
-                device=combined.device, dtype=combined.dtype,
-            )
-            pathway_s = self.pathway_score_layer(act)         # [B, 6]
-            pathway_s = self.pathway_norm(pathway_s)
-            combined = torch.cat([combined, pathway_s], dim=-1)  # [B, 522]
-
-        # Bước 7: Thâm nhập lớp quy hoạch ngõ ra chuẩn (Classifier)
-        logits = self.classifier(combined)
-        return logits
+        h = self._apply_injections(
+            h_trans, attention_mask, activation_vector, gene_stats,
+        )
+        return self._classify(h, attention_mask, activation_vector,
+                              gene_stats, codon_features)
 
     def forward_head(
         self,
@@ -319,78 +521,46 @@ class PhaBERTCNN_GeneGated(nn.Module):
         attention_mask: torch.Tensor,
         activation_vector: Optional[torch.Tensor] = None,
         gene_stats: Optional[torch.Tensor] = None,
+        codon_features: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Pha suy luận rút gọn theo cơ chế bypass (tiến trình bỏ qua) áp dụng cho luồng truy xuất cache đặc trưng.
-        Thực thi chuyên biệt tại Bước 1 (Phase 1 cache mode) để triệt tiêu thời gian chi phí hoạt động qua trung tâm DNABERT-2 ở mỗi chu trình lặp (epoch).
+        """Bypass backbone (cache mode); injection + head giống `forward`."""
+        h_trans = h_trans.float()
+        h = self._apply_injections(
+            h_trans, attention_mask, activation_vector, gene_stats,
+        )
+        return self._classify(h, attention_mask, activation_vector,
+                              gene_stats, codon_features)
 
-        Tham số nạp:
-            h_trans:           Khoảng [B, L, 768] — Biểu diễn chuỗi nền tảng truy xuất trạng thái cache (fp16 hoặc cấp fp32)
-            attention_mask:    Khoảng [B, L]
-            activation_vector: Khoảng [B, N_FAMILIES] hoặc tham số bỏ qua (None)
-            gene_stats:        Khoảng [B, 4] hoặc tham số rỗng (None)
-
-        Giá trị trả về (Returns):
-            logits:            Chuẩn [B, 2]
-        """
-        h = h_trans.float()
-
-        if self.use_gate:
-            if activation_vector is None:
-                gate = torch.zeros(
-                    h.size(0), self.embedding_dim,
-                    device=h.device, dtype=h.dtype,
-                )
-            else:
-                gate = self.gene_gate(activation_vector)
-            h_gated = h + h * gate.unsqueeze(1)
-        else:
-            h_gated = h
-
-        cnn_input = h_gated.transpose(1, 2)
-        cnn_features = [branch(cnn_input) for branch in self.cnn_branches]
-        cnn_out = torch.cat(cnn_features, dim=-1)
-
-        context_vector, _ = self.attention_pooling(h_gated, attention_mask)
-        global_out = self.global_projection(context_vector)
-
-        combined = torch.cat([cnn_out, global_out], dim=-1)
-        if self.use_gene_stats:
-            stats = gene_stats if gene_stats is not None else torch.zeros(
-                combined.size(0), 4, device=combined.device, dtype=combined.dtype,
-            )
-            stats = self.gene_stats_norm(stats)
-            combined = torch.cat([combined, stats], dim=-1)
-
-        if self.use_pathway_scores:
-            act = activation_vector if activation_vector is not None else torch.zeros(
-                combined.size(0), self.n_families,
-                device=combined.device, dtype=combined.dtype,
-            )
-            pathway_s = self.pathway_score_layer(act)
-            pathway_s = self.pathway_norm(pathway_s)
-            combined = torch.cat([combined, pathway_s], dim=-1)
-
-        return self.classifier(combined)
-
-    # --- Hàm hỗ trợ điều phối tỉ lệ học phân biệt chiều hướng (Discriminative Learning Rate Helpers) ---
+    # ============================================================
+    # Helpers cho discriminative LR
+    # ============================================================
 
     def get_backbone_params(self):
         return self.backbone.parameters()
 
     def get_task_params(self):
-        """Quy định chu kỳ hội tụ dành cho toàn bộ biến tham số chuyên biệt hệ thống (ngoại trừ backbone - thường được chỉ định nhân LR cường độ 10x)."""
-        params = []
-        for module in [
+        """Tham số học chuyên biệt task (ngoại trừ backbone)."""
+        modules = [
             self.cnn_branches,
             self.attention_pooling,
             self.global_projection,
             self.classifier,
-        ]:
-            params.extend(module.parameters())
+        ]
+        if self.use_gate or self.use_cross_attn:
+            modules.append(self.cond_encoder)
         if self.use_gate:
-            params.extend(self.gene_gate.parameters())
-        # Chú thích thiết kế: Tầng PathwayScoreLayer thuần túy là dữ liệu tĩnh đệm (buffer) và không sở hữu các hệ số học tuyến tính trainable → bỏ qua trong trình tính hàm này.
+            modules.append(self.film)
+        if self.use_cross_attn:
+            modules.append(self.cross_attn)
+        if self.use_pathway_scores:
+            modules.append(self.family_aggregator)
+        if self.use_gene_stats:
+            modules.append(self.gene_stats_norm)
+        if self.use_codon:
+            modules.append(self.codon_branch)
+        params = []
+        for m in modules:
+            params.extend(m.parameters())
         return params
 
     def freeze_backbone(self):
@@ -405,4 +575,6 @@ class PhaBERTCNN_GeneGated(nn.Module):
         return (f"use_gate={self.use_gate}, "
                 f"use_gene_stats={self.use_gene_stats}, "
                 f"use_pathway_scores={self.use_pathway_scores}, "
+                f"use_cross_attn={self.use_cross_attn}, "
+                f"use_codon={self.use_codon}, "
                 f"n_families={self.n_families}")

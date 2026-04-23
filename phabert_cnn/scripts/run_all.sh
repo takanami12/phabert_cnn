@@ -41,7 +41,7 @@ echo "Working directory: $(pwd)"
 SKIP_ANNOTATE=false
 SKIP_PREPARE=false
 USE_LORA=true
-USE_COMPILE=true
+USE_COMPILE=false
 GPU_ID=0
 GROUPS="A B C D"
 FOLDS=5

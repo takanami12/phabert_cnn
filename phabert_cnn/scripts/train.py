@@ -383,11 +383,6 @@ def main():
     model = model.to(device)
     print(f"  Tổng số tham số: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Tùy chọn: torch.compile (nhanh hơn 20-30% sau warmup)
-    if args.compile:
-        print("  Đã bật torch.compile (batch đầu tiên cần ~2 phút để compile)")
-        model = torch.compile(model, mode="reduce-overhead")
-
     criterion = nn.CrossEntropyLoss()
     use_amp   = device.type == "cuda"
     scaler    = torch.amp.GradScaler("cuda") if use_amp else None
@@ -504,6 +499,8 @@ def main():
     if args.lora:
         # setup_lora đặt tham số non-LoRA của backbone thành requires_grad=False
         # và tham số LoRA thành requires_grad=True.  KHÔNG gọi unfreeze_backbone().
+        # Phải gọi TRƯỚC torch.compile vì compile bọc model trong OptimizedModule
+        # khiến 'model.backbone = ...' không còn sửa được _orig_mod.backbone nữa.
         targets = [t.strip() for t in args.lora_targets.split(",")]
         model   = setup_lora(model, args.lora_r, args.lora_alpha,
                              args.lora_dropout, targets)
@@ -512,6 +509,14 @@ def main():
     else:
         model.unfreeze_backbone()
         backbone_params = list(model.get_backbone_params())
+
+    # torch.compile sau LoRA setup và trước optimizer để:
+    # 1. load_state_dict (Phase 1) không bị _orig_mod prefix
+    # 2. model.backbone = get_peft_model(...) sửa đúng vào _orig_mod
+    # 3. optimizer nhận đúng tham số đã compile
+    if args.compile:
+        print("  Đã bật torch.compile (batch đầu tiên cần ~2 phút để compile)")
+        model = torch.compile(model, mode="reduce-overhead")
 
     n_train_p2 = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Tham số trainable (Phase 2): {n_train_p2:,}")

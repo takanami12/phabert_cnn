@@ -80,14 +80,16 @@ class GeneGateMLP(nn.Module):
     def __init__(self, n_families: int = 24, hidden_dim: int = 128,
                  output_dim: int = 768):
         super().__init__()
+        self.input_norm = nn.LayerNorm(n_families)
         self.fc1 = nn.Linear(n_families, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, output_dim)
         self.activation = nn.ReLU(inplace=True)
         self.layer_norm = nn.LayerNorm(hidden_dim)
 
-        # Giai đoạn thiết lập chuẩn định hình trọng số lớp fc2 tiệm cận zero (zero-centered init)
-        # Giúp bộ phân phối xác suất kiểm soát (gate distribution) tiệm cận gốc 0.
-        # Hệ quả: Hệ thống hội tụ với đặc tính (h_gated ≈ h_trans) tại chu trình huấn luyện ban đầu.
+        # Identity init: weight + bias = 0 → fc2 output = 0 → tanh(0) = 0.
+        # Kết hợp với h_gated = h_trans + h_trans * gate ở forward chính
+        # → gate=0 day-1 → h_gated = h_trans (giữ nguyên phân phối backbone).
+        nn.init.zeros_(self.fc2.weight)
         nn.init.zeros_(self.fc2.bias)
 
     def forward(self, activation_vector: torch.Tensor) -> torch.Tensor:
@@ -96,13 +98,14 @@ class GeneGateMLP(nn.Module):
             activation_vector: [B, N_FAMILIES]
 
         Kết quả (Returns):
-            gate: Ngõ ra cấp tín hiệu gating [B, 768] biên độ ngưỡng chuẩn hóa đoạn [0, 1]
+            gate: Ngõ ra cấp tín hiệu gating [B, 768], miền giá trị [-1, 1] (tanh).
         """
-        h = self.fc1(activation_vector)
+        h = self.input_norm(activation_vector)
+        h = self.fc1(h)
         h = self.layer_norm(h)
         h = self.activation(h)
         h = self.fc2(h)
-        return torch.sigmoid(h)
+        return torch.tanh(h)
 
 
 class PhaBERTCNN_GeneGated(nn.Module):
@@ -112,12 +115,12 @@ class PhaBERTCNN_GeneGated(nn.Module):
     Khuôn khổ hoạt động:
         1. Base mô hình lõi DNABERT-2         → h_trans [B, L, 768]
         2. Kênh tín hiệu cổng gen (chuẩn tiêm dữ liệu thặng dư - residual injection):
-               g = GeneGateMLP(activation_vector)
+               g = GeneGateMLP(activation_vector)  # tanh, init=0 → identity day-1
                h_gated = h_trans + h_trans * g.unsqueeze(1)
         3. CNN đa tầng hoạt động trên h_gated → cnn_out [B, 384]
         4. Tích hợp chú ý (Attention) từ h_gated→ global_out [B, 128]
-        5. Phối hợp yếu tố gene_stats         → combined [B, 516]
-        6. Trọng số lộ trình (không khả huấn) → combined [B, 522]
+        5. Phối hợp yếu tố gene_stats (LayerNorm) → combined [B, 516]
+        6. Trọng số lộ trình (LayerNorm)      → combined [B, 522]
         7. Không gian quyết định (Classifier) → logits [B, 2]
 
     Cấu hình đầu vào quy trình phân lớp cuối:
@@ -211,6 +214,13 @@ class PhaBERTCNN_GeneGated(nn.Module):
         # --- Giai đoạn lọc đặc tính chuyên môn Pathway score layer (Giao thức tiền giả thiết Inject 3, cơ chế tĩnh không khả huấn) ---
         if self.use_pathway_scores:
             self.pathway_score_layer = PathwayScoreLayer(n_families=n_families)
+            # Bit-scores HMM thô có biên độ rộng (10–100) → norm về cùng scale
+            # với feature NN trước khi concat vào classifier.
+            self.pathway_norm = nn.LayerNorm(PathwayScoreLayer.N_PATHWAYS)
+
+        # Norm gene_stats riêng (count/density/coding_frac/strand_bias khác scale)
+        if self.use_gene_stats:
+            self.gene_stats_norm = nn.LayerNorm(n_gene_stats)
 
         # --- Trạm quyết định (Classifier) ---
         # Tổng hòa đầu vào: 384 (mạch CNN) + 128 (mạch attn) = chuẩn hóa 512 chiểu
@@ -286,6 +296,7 @@ class PhaBERTCNN_GeneGated(nn.Module):
                 combined.size(0), 4,
                 device=combined.device, dtype=combined.dtype,
             )
+            stats = self.gene_stats_norm(stats)
             combined = torch.cat([combined, stats], dim=-1)   # [B, 516]
 
         # Bước 6: Tập hợp thông số chuẩn đích ngắm (Pathway scores - Cơ chế Inject 3 — Khảo sát tĩnh không tham gia mạng hội tụ trainable)
@@ -295,6 +306,7 @@ class PhaBERTCNN_GeneGated(nn.Module):
                 device=combined.device, dtype=combined.dtype,
             )
             pathway_s = self.pathway_score_layer(act)         # [B, 6]
+            pathway_s = self.pathway_norm(pathway_s)
             combined = torch.cat([combined, pathway_s], dim=-1)  # [B, 522]
 
         # Bước 7: Thâm nhập lớp quy hoạch ngõ ra chuẩn (Classifier)
@@ -347,6 +359,7 @@ class PhaBERTCNN_GeneGated(nn.Module):
             stats = gene_stats if gene_stats is not None else torch.zeros(
                 combined.size(0), 4, device=combined.device, dtype=combined.dtype,
             )
+            stats = self.gene_stats_norm(stats)
             combined = torch.cat([combined, stats], dim=-1)
 
         if self.use_pathway_scores:
@@ -355,6 +368,7 @@ class PhaBERTCNN_GeneGated(nn.Module):
                 device=combined.device, dtype=combined.dtype,
             )
             pathway_s = self.pathway_score_layer(act)
+            pathway_s = self.pathway_norm(pathway_s)
             combined = torch.cat([combined, pathway_s], dim=-1)
 
         return self.classifier(combined)

@@ -92,6 +92,17 @@ def parse_args():
     parser.add_argument("--compile", action="store_true",
                         help="torch.compile mô hình (~25%% nhanh hơn trên GPU hiện đại)")
 
+    # --- Ablation / cache management ---
+    parser.add_argument("--reset_cache", action="store_true",
+                        help="Xoá after_warmup.pt + best_model.pt trước khi chạy "
+                             "để tránh load stale checkpoint từ lần chạy trước.")
+    parser.add_argument("--mask_exclusive_lysogenic", action="store_true",
+                        help="Ablation: zero-out các family 'exclusive_lysogenic' "
+                             "(integrase/excisionase/superinfection-immunity) trong "
+                             "activation vector để kiểm tra circular label leakage.")
+    parser.add_argument("--vocab_path", type=str, default="data/hmm/vocabulary.json",
+                        help="Đường dẫn vocabulary.json (cần cho --mask_exclusive_lysogenic)")
+
     return parser.parse_args()
 
 
@@ -243,13 +254,17 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def _forward(model: nn.Module, batch: dict, device: torch.device, gated: bool):
+def _forward(model: nn.Module, batch: dict, device: torch.device, gated: bool,
+             mask_indices: Optional[list] = None):
     """
     Khối truyền thẳng (forward pass) được hợp nhất cho cả hai điều kiện môi trường.
 
     Xử lý linh động xuyên suốt cấu trúc logic:
       • Chế độ tiêu chuẩn (Standard mode) — Mỗi lô (batch) chứa 'input_ids'; tiến hành lan truyền toàn bộ mô hình (backbone + head).
       • Chế độ bộ nhớ đệm (Cache mode)  — Lô chứa 'h_trans'; bỏ qua mô hình lõi (backbone), chỉ thực thi lớp phân loại học tăng cường (head).
+
+    mask_indices: danh sách index trên activation sẽ bị zero-out (ablation
+                  circular leakage qua exclusive_lysogenic markers).
     """
     attention_mask = batch['attention_mask'].to(device, non_blocking=True)
     labels         = batch['label'].to(device, non_blocking=True)
@@ -264,6 +279,9 @@ def _forward(model: nn.Module, batch: dict, device: torch.device, gated: bool):
         if gated:
             activation = batch['activation'].to(device, non_blocking=True)
             gene_stats = batch['gene_stats'].to(device, non_blocking=True)
+            if mask_indices:
+                activation = activation.clone()
+                activation[:, mask_indices] = 0.0
             logits = model.forward_head(
                 h, attention_mask, activation, gene_stats,
                 codon_features=codon,
@@ -276,6 +294,9 @@ def _forward(model: nn.Module, batch: dict, device: torch.device, gated: bool):
         if gated:
             activation = batch['activation'].to(device, non_blocking=True)
             gene_stats = batch['gene_stats'].to(device, non_blocking=True)
+            if mask_indices:
+                activation = activation.clone()
+                activation[:, mask_indices] = 0.0
             logits = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -294,7 +315,7 @@ def _forward(model: nn.Module, batch: dict, device: torch.device, gated: bool):
 # ================================================================
 
 def train_one_epoch(model, loader, optimizer, scheduler, criterion, device,
-                    gated, scaler=None):
+                    gated, scaler=None, mask_indices=None):
     model.train()
     total_loss = 0.0
     all_preds, all_labels = [], []
@@ -305,13 +326,13 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, device,
 
         if use_amp:
             with torch.amp.autocast('cuda', dtype=torch.float16):
-                logits, labels = _forward(model, batch, device, gated)
+                logits, labels = _forward(model, batch, device, gated, mask_indices)
                 loss = criterion(logits, labels)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
-            logits, labels = _forward(model, batch, device, gated)
+            logits, labels = _forward(model, batch, device, gated, mask_indices)
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
@@ -328,13 +349,13 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, device,
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device, gated):
+def evaluate(model, loader, criterion, device, gated, mask_indices=None):
     model.eval()
     total_loss = 0.0
     nan_batches = 0
     all_preds, all_labels = [], []
     for batch in tqdm(loader, desc="Validation"):
-        logits, labels = _forward(model, batch, device, gated)
+        logits, labels = _forward(model, batch, device, gated, mask_indices)
         logits = logits.float()
         # Defensive: nếu forward có bất kỳ NaN/Inf nào → log và clamp.
         # Root cause bug phải được fix trong model; đây chỉ để val không
@@ -425,6 +446,21 @@ def main():
     if use_amp:
         print("  Đã bật Mixed Precision (AMP)")
 
+    # ---------- Load mask indices cho ablation circular leakage ----------
+    mask_indices = None
+    if args.gated and args.mask_exclusive_lysogenic:
+        vocab_path = Path(args.vocab_path)
+        if not vocab_path.exists():
+            raise FileNotFoundError(
+                f"--mask_exclusive_lysogenic yêu cầu {vocab_path} nhưng không tìm thấy"
+            )
+        with open(vocab_path) as f:
+            vocab = json.load(f)
+        mask_indices = sorted(set(
+            vocab.get("exclusive_lysogenic_indices", [])
+        ))
+        print(f"  [Ablation] Zero-out activation indices: {mask_indices}")
+
     # ---------- Đường dẫn đầu ra ----------
     mode_suffix = "gated" if args.gated else "baseline"
     if args.gated:
@@ -434,10 +470,20 @@ def main():
         if args.use_cross_attn:    mode_suffix += "_xattn"
         if args.use_codon:         mode_suffix += "_codon"
         if args.lora:              mode_suffix += "_lora"
+    if args.mask_exclusive_lysogenic and args.gated:
+        mode_suffix += "_masklyso"
     run_dir = (Path(args.output_dir) / f"group_{args.group}"
                / f"fold_{args.fold}_{mode_suffix}")
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Thư mục đầu ra: {run_dir}")
+
+    # Reset cache để tránh load checkpoint cũ từ lần chạy trước (feature version khác)
+    if args.reset_cache:
+        for name in ("after_warmup.pt", "best_model.pt"):
+            p = run_dir / name
+            if p.exists():
+                print(f"  [reset_cache] Xoá {p}")
+                p.unlink()
 
     training_log = {"args": vars(args), "phases": []}
 
@@ -465,7 +511,7 @@ def main():
     warmup_skip_path = run_dir / "after_warmup.pt"
     if warmup_skip_path.exists():
         print("  [Bỏ qua] Đang tải checkpoint warmup, bỏ qua Phase 1...")
-        ckpt = torch.load(warmup_skip_path, map_location=device)
+        ckpt = torch.load(warmup_skip_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
     else:
         # --- Tùy chọn: cache hidden states backbone để Phase 1 nhanh hơn ---
@@ -510,9 +556,11 @@ def main():
             train_loss, train_metrics = train_one_epoch(
                 model, p1_train_loader, optimizer_p1, scheduler_p1, criterion,
                 device, gated=args.gated, scaler=scaler,
+                mask_indices=mask_indices,
             )
             val_loss, val_metrics = evaluate(
                 model, val_loader, criterion, device, gated=args.gated,
+                mask_indices=mask_indices,
             )
             print(f"  Train Loss: {train_loss:.4f}")
             print_metrics(train_metrics, prefix="  Train ")
@@ -586,9 +634,11 @@ def main():
         train_loss, train_metrics = train_one_epoch(
             model, train_loader, optimizer_p2, scheduler_p2, criterion,
             device, gated=args.gated, scaler=scaler,
+            mask_indices=mask_indices,
         )
         val_loss, val_metrics = evaluate(
             model, val_loader, criterion, device, gated=args.gated,
+            mask_indices=mask_indices,
         )
 
         elapsed = time.time() - t_start

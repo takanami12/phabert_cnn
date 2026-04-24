@@ -128,33 +128,86 @@ def prepare_genome_dataset(
     for pattern in temperate_patterns:
         temperate_files.extend(sorted(data_dir.glob(pattern)))
 
-    # Tiến trình khai thác tài nguyên điểm FASTA
+    # Dedup theo (1) record.id, (2) hash chuỗi (catch cùng genome tên khác),
+    # (3) hash k-mer minhash thô để bắt near-duplicate (>95% identity).  Bước
+    # (3) dùng sketch đơn giản: lấy min 128 hash của 21-mer — tương tự MinHash
+    # độ tương đồng Jaccard, rẻ hơn CD-HIT nhiều.
+    import hashlib
+
+    def _seq_hash(seq: str) -> str:
+        return hashlib.md5(seq.encode("ascii", errors="ignore")).hexdigest()
+
+    def _minhash_sketch(seq: str, k: int = 21, n_hash: int = 128) -> frozenset:
+        if len(seq) < k:
+            return frozenset()
+        # Chỉ lấy min-hash của k-mer; đủ để check Jaccard thô giữa 2 genome.
+        hashes = set()
+        for i in range(0, len(seq) - k + 1, max(1, (len(seq) - k + 1) // (n_hash * 8))):
+            kmer = seq[i:i + k]
+            if "N" in kmer:
+                continue
+            hashes.add(int(hashlib.md5(kmer.encode()).hexdigest()[:8], 16))
+        # Lấy n_hash giá trị nhỏ nhất làm sketch
+        return frozenset(sorted(hashes)[:n_hash])
+
+    def _jaccard(a: frozenset, b: frozenset) -> float:
+        if not a or not b:
+            return 0.0
+        return len(a & b) / len(a | b)
+
     seen_ids = set()
+    seen_hashes = set()
+    sketches: List[Tuple[str, frozenset, int]] = []  # (gid, sketch, label)
+    NEAR_DUP_THRESHOLD = 0.90   # Jaccard của MinHash sketch
     genomes: List[Tuple[str, str, int]] = []
+
+    def _try_add(gid: str, seq: str, label: int) -> Tuple[bool, str]:
+        if gid in seen_ids:
+            return False, "id"
+        h = _seq_hash(seq)
+        if h in seen_hashes:
+            return False, "exact-seq"
+        sketch = _minhash_sketch(seq)
+        for prev_gid, prev_sketch, prev_label in sketches:
+            if _jaccard(sketch, prev_sketch) >= NEAR_DUP_THRESHOLD:
+                return False, f"near-dup({prev_gid},label={prev_label})"
+        seen_ids.add(gid)
+        seen_hashes.add(h)
+        sketches.append((gid, sketch, label))
+        genomes.append((gid, seq, label))
+        return True, "ok"
+
+    skip_counts = {"id": 0, "exact-seq": 0, "near-dup": 0}
 
     for fp in virulent_files:
         print(f"Trạng thái nạp: Giải mã tệp cơ sở hệ gen chủng độc lực tại vị trí: {fp}")
         raw = _load_fasta_with_ids(fp, label=1)
         added = 0
         for gid, seq, label in raw:
-            if gid in seen_ids:
-                continue
-            seen_ids.add(gid)
-            genomes.append((gid, seq, label))
-            added += 1
-        print(f"  -> Xử lý tổng {len(raw)} cấu trúc thô, Ghi nhận mới {added} hồ sơ hệ gen (Trạng thái hậu xác minh hợp lệ)")
+            ok, reason = _try_add(gid, seq, label)
+            if ok:
+                added += 1
+            else:
+                key = "near-dup" if reason.startswith("near-dup") else reason
+                skip_counts[key] = skip_counts.get(key, 0) + 1
+        print(f"  -> Tổng {len(raw)} thô, thêm mới {added}")
 
     for fp in temperate_files:
         print(f"Trạng thái nạp: Giải mã tệp cơ sở hệ gen chủng ôn hoà tại vị trí: {fp}")
         raw = _load_fasta_with_ids(fp, label=0)
         added = 0
         for gid, seq, label in raw:
-            if gid in seen_ids:
-                continue
-            seen_ids.add(gid)
-            genomes.append((gid, seq, label))
-            added += 1
-        print(f"  -> Xử lý tổng {len(raw)} cấu trúc thô, Ghi nhận mới {added} hồ sơ hệ gen (Trạng thái hậu xác minh hợp lệ)")
+            ok, reason = _try_add(gid, seq, label)
+            if ok:
+                added += 1
+            else:
+                key = "near-dup" if reason.startswith("near-dup") else reason
+                skip_counts[key] = skip_counts.get(key, 0) + 1
+        print(f"  -> Tổng {len(raw)} thô, thêm mới {added}")
+
+    print(f"\nDedup report — bỏ qua: id={skip_counts['id']}, "
+          f"exact-seq={skip_counts['exact-seq']}, "
+          f"near-dup(Jaccard≥{NEAR_DUP_THRESHOLD})={skip_counts['near-dup']}")
 
     # Tóm tắt
     n_vir = sum(1 for _, _, l in genomes if l == 1)

@@ -88,7 +88,9 @@ def save_fold_split(
     labels,
     activations=None,
     gene_stats=None,
+    codon_features=None,
     n_families=None,
+    codon_feature_dim=None,
 ):
     """Tiến hành lưu một phân vùng đánh giá (fold, split) — bao gồm định dạng dữ liệu tuần tự chuẩn pkl và dữ liệu nạp bổ sung .pt (nếu được kích hoạt cấu hình module)."""
     fold_dir.mkdir(parents=True, exist_ok=True)
@@ -105,12 +107,20 @@ def save_fold_split(
         stats = np.stack(gene_stats) if gene_stats else np.zeros((0, 4), dtype=np.float32)
         n_genes = stats[:, 0].astype(np.int64) if stats.size else np.zeros(0, dtype=np.int64)
 
-        torch.save({
+        payload = {
             "activations": torch.from_numpy(acts.astype(np.float32)),
             "gene_stats":  torch.from_numpy(stats.astype(np.float32)),
             "n_genes":     torch.from_numpy(n_genes),
             "n_families":  int(n_families),
-        }, pt_path)
+        }
+        if codon_features is not None:
+            codon_arr = (
+                np.stack(codon_features) if codon_features
+                else np.zeros((0, codon_feature_dim or 65), dtype=np.float32)
+            )
+            payload["codon_features"] = torch.from_numpy(codon_arr.astype(np.float32))
+            payload["codon_feature_dim"] = int(codon_feature_dim or codon_arr.shape[-1])
+        torch.save(payload, pt_path)
 
 
 # ============================================================
@@ -239,18 +249,24 @@ def main():
             fold_dir = group_dir / f"fold_{fold_idx}"
 
             for split_name in ("train", "val", "test"):
+                # RC augmentation CHỈ cho train — val/test phải đánh giá
+                # trên sample độc lập, không paired fwd/rc.
                 out = generate_dataset_contigs(
                     genomes=fold_data[split_name],
                     group_config=group_config,
                     aggregator=aggregator,
-                    use_reverse_complement=True,
+                    use_reverse_complement=(split_name == "train"),
                     seed=args.seed + fold_idx * 100 + ord(group_name),
                     max_contigs_per_genome=args.max_contigs,
                     overlap_min=args.overlap_min,
                 )
 
+                codon_features = None
                 if aggregator is not None:
-                    sequences, labels, activations, gene_stats = out
+                    if len(out) == 5:
+                        sequences, labels, activations, gene_stats, codon_features = out
+                    else:
+                        sequences, labels, activations, gene_stats = out
                 else:
                     sequences, labels = out
                     activations, gene_stats = None, None
@@ -262,7 +278,9 @@ def main():
                     labels=labels,
                     activations=activations,
                     gene_stats=gene_stats,
+                    codon_features=codon_features,
                     n_families=n_families,
+                    codon_feature_dim=getattr(aggregator, "codon_feature_dim", None),
                 )
 
                 # Tổng hợp thống kê phản hồi màn hình stdout

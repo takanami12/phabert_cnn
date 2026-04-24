@@ -40,13 +40,16 @@ echo "Working directory: $(pwd)"
 # ============================================================
 SKIP_ANNOTATE=false
 SKIP_PREPARE=false
-USE_LORA=true
+USE_LORA=false
 USE_COMPILE=false
+RESET_CACHE=false            # Xoá after_warmup.pt + best_model.pt trước khi chạy
+MASK_LYSO=false              # Ablation: zero-out exclusive lysogenic markers
+EVAL_SPLIT=test              # val cho tuning, test cho final reporting
 GPU_ID=0
 GROUPS="A B C D"
 FOLDS=5
 N_FAMILIES=26
-BATCH_SIZE=64
+BATCH_SIZE=128
 NUM_WORKERS=4
 WARMUP_EPOCHS=1
 FINETUNE_EPOCHS=10
@@ -62,6 +65,9 @@ for arg in "$@"; do
         --skip_prepare)    SKIP_PREPARE=true   ;;
         --no_lora)         USE_LORA=false       ;;
         --no_compile)      USE_COMPILE=false    ;;
+        --reset_cache)     RESET_CACHE=true     ;;
+        --mask_lyso)       MASK_LYSO=true       ;;
+        --eval_split=*)    EVAL_SPLIT="${arg#*=}" ;;
         --gpu=*)           GPU_ID="${arg#*=}"   ;;
         --groups=*)        GROUPS="${arg#*=}"; GROUPS="${GROUPS//,/ }" ;;
         --folds=*)         FOLDS="${arg#*=}";  FOLDS="${FOLDS//,/ }"  ;;
@@ -85,6 +91,16 @@ fi
 COMPILE_FLAG=""
 if [ "$USE_COMPILE" = true ]; then
     COMPILE_FLAG="--compile"
+fi
+
+MASK_LYSO_FLAG=""
+if [ "$MASK_LYSO" = true ]; then
+    MASK_LYSO_FLAG="--mask_exclusive_lysogenic"
+fi
+
+RESET_CACHE_FLAG=""
+if [ "$RESET_CACHE" = true ]; then
+    RESET_CACHE_FLAG="--reset_cache"
 fi
 
 echo "========================================================"
@@ -181,7 +197,9 @@ for group in A B C D; do
             --finetune_epochs "$FINETUNE_EPOCHS" \
             --patience        "$PATIENCE"        \
             $LORA_FLAG                           \
-            $COMPILE_FLAG
+            $COMPILE_FLAG                        \
+            $MASK_LYSO_FLAG                      \
+            $RESET_CACHE_FLAG
 
         echo "  Done: Group $group, Fold $fold"
     done
@@ -213,8 +231,9 @@ for group in A B C D; do
         --use_cross_attn             \
         --n_families  "$N_FAMILIES"  \
         --num_workers "$NUM_WORKERS" \
-        --eval_split  val            \
-        $LORA_FLAG
+        --eval_split  "$EVAL_SPLIT"  \
+        $LORA_FLAG                   \
+        $MASK_LYSO_FLAG
 
     echo "  Done: Group $group"
 done

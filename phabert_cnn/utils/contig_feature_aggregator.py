@@ -82,7 +82,9 @@ class ContigFeatureAggregator:
             vocab_path:       đường dẫn tới vocabulary.json
         """
         self.genome_to_genes: Dict[str, List[dict]] = {}
+        self.genome_to_codon: Dict[str, np.ndarray] = {}
         self.n_families: Optional[int] = None
+        self.codon_feature_dim: Optional[int] = None
 
         # Tải tất cả annotations
         for ap in annotation_paths:
@@ -107,6 +109,23 @@ class ContigFeatureAggregator:
                 # Sắp xếp theo start để truy vấn nhanh hơn
                 sorted_genes = sorted(genes, key=lambda g: g["start"])
                 self.genome_to_genes[gid] = sorted_genes
+
+            # Codon features: per-genome vector, align với contig_ids
+            codon = data.get("codon_features")
+            contig_ids = data.get("contig_ids")
+            if codon is not None and contig_ids is not None:
+                local_dim = data.get("codon_feature_dim", codon.shape[-1])
+                if self.codon_feature_dim is None:
+                    self.codon_feature_dim = int(local_dim)
+                elif self.codon_feature_dim != int(local_dim):
+                    raise ValueError(
+                        f"codon_feature_dim không nhất quán: "
+                        f"{self.codon_feature_dim} vs {local_dim} trong {ap}"
+                    )
+                codon_np = codon.detach().cpu().numpy().astype(np.float32)
+                for gid, vec in zip(contig_ids, codon_np):
+                    if gid not in self.genome_to_codon:
+                        self.genome_to_codon[gid] = vec
 
         # Tải vocabulary
         with open(vocab_path) as f:
@@ -147,6 +166,10 @@ class ContigFeatureAggregator:
     def has_genome(self, genome_id: str) -> bool:
         return genome_id in self.genome_to_genes
 
+    def get_codon(self, genome_id: str) -> Optional[np.ndarray]:
+        """Trả codon vector cho genome (None nếu thiếu hoặc aggregator không load codon)."""
+        return self.genome_to_codon.get(genome_id)
+
     def get_features(
         self,
         genome_id: str,
@@ -157,6 +180,14 @@ class ContigFeatureAggregator:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Tổng hợp features cho một cửa sổ contig.
+
+        CẢNH BÁO: gene predictions được tính bởi pyrodigal trên FULL genome
+        (thời điểm preprocess), rồi ánh xạ lại vào cửa sổ contig. Tại inference
+        thực (user chỉ có contig lẻ, không có full genome), gene predictions
+        sẽ noise hơn vì pyrodigal meta-mode trên chuỗi ngắn kém chính xác.
+        → Distribution shift train↔deploy. Nếu muốn evaluation khớp deployment,
+        chạy pyrodigal + pyhmmer trực tiếp trên từng contig val/test thay vì
+        dùng aggregator này (xem preprocess_gene_features.process_pkl()).
 
         Args:
             genome_id:           ID bộ gen nguồn (khớp với header FASTA)

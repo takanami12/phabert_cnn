@@ -47,6 +47,11 @@ def parse_args():
                         help="Phải khớp cờ đã dùng khi huấn luyện")
     parser.add_argument("--lora", action="store_true",
                         help="Xác định mô hình đã được huấn luyện bằng phương pháp tối ưu hóa tham số cục bộ (LoRA), ảnh hưởng tới tên cấu trúc thư mục lưu trữ")
+    parser.add_argument("--mask_exclusive_lysogenic", action="store_true",
+                        help="Phải khớp cờ đã dùng khi huấn luyện (ablation).")
+    parser.add_argument("--vocab_path", type=str,
+                        default="data/hmm/vocabulary.json",
+                        help="Đường dẫn vocabulary.json cho mask indices")
     parser.add_argument("--n_families", type=int, default=26)
 
     # --- Tham số cho quá trình suy luận (Inference parameters) ---
@@ -67,12 +72,13 @@ def get_mode_suffix(args) -> str:
     """Định dạng hậu tố của thư mục trọng số (checkpoint) — phải khớp train.py."""
     suffix = "gated" if args.gated else "baseline"
     if args.gated:
-        if args.no_gate:           suffix += "_nogate"
-        if args.no_gene_stats:     suffix += "_nostats"
-        if args.no_pathway_scores: suffix += "_nopath"
-        if args.use_cross_attn:    suffix += "_xattn"
-        if args.use_codon:         suffix += "_codon"
-        if args.lora:              suffix += "_lora"
+        if args.no_gate:                 suffix += "_nogate"
+        if args.no_gene_stats:           suffix += "_nostats"
+        if args.no_pathway_scores:       suffix += "_nopath"
+        if args.use_cross_attn:          suffix += "_xattn"
+        if args.use_codon:               suffix += "_codon"
+        if args.lora:                    suffix += "_lora"
+        if args.mask_exclusive_lysogenic: suffix += "_masklyso"
     return suffix
 
 
@@ -90,6 +96,7 @@ def evaluate_fold(
     dataloader: DataLoader,
     device: torch.device,
     gated: bool,
+    mask_indices=None,
 ) -> dict:
     """Thực thi suy luận (inference) và trả về các thang đo đánh giá kết hợp cùng xác suất nhận dạng phage độc lực (virulent) trên từng mẫu."""
     model.eval()
@@ -108,6 +115,9 @@ def evaluate_fold(
                 codon = batch.get("codon_features")
                 if codon is not None:
                     codon = codon.to(device, non_blocking=True)
+                if mask_indices:
+                    activation = activation.clone()
+                    activation[:, mask_indices] = 0.0
                 logits = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -145,6 +155,19 @@ def main():
     )
     mode_suffix = get_mode_suffix(args)
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Load mask indices nếu có — bằng logic giống train.py
+    mask_indices = None
+    if args.gated and args.mask_exclusive_lysogenic:
+        vocab_path = Path(args.vocab_path)
+        if not vocab_path.exists():
+            raise FileNotFoundError(
+                f"--mask_exclusive_lysogenic cần {vocab_path} nhưng không tìm thấy"
+            )
+        with open(vocab_path) as f:
+            vocab = json.load(f)
+        mask_indices = sorted(set(vocab.get("exclusive_lysogenic_indices", [])))
+        print(f"  [Ablation] Mask activation indices: {mask_indices}")
 
     print(f"Evaluating Group {args.group} | mode={mode_suffix} | split={args.eval_split}")
     print(f"Device: {device}")
@@ -244,7 +267,10 @@ def main():
         model.eval()
 
         # ---- Tiến hành Đánh giá (Evaluate) ----
-        metrics = evaluate_fold(model, dataloader, device, gated=args.gated)
+        metrics = evaluate_fold(
+            model, dataloader, device, gated=args.gated,
+            mask_indices=mask_indices,
+        )
         all_fold_metrics.append(metrics)
         print_metrics(metrics, prefix="  ")
 

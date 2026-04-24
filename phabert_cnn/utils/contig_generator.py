@@ -131,8 +131,11 @@ def generate_dataset_contigs(
     all_labels: List[int] = []
     all_activations: List[np.ndarray] = []
     all_gene_stats: List[np.ndarray] = []
+    all_codon: List[np.ndarray] = []
 
     use_features = aggregator is not None
+    codon_dim = getattr(aggregator, "codon_feature_dim", None) if use_features else None
+    has_codon = use_features and codon_dim is not None
 
     for i, (genome_id, genome_seq, label) in enumerate(genomes):
         # Sinh cửa sổ cho bộ gen này: danh sách (seq, start, end)
@@ -151,6 +154,12 @@ def generate_dataset_contigs(
             )
             windows = [windows[j] for j in indices]
 
+        # Codon vector per-genome (share cho mọi contig của cùng genome)
+        if has_codon:
+            codon_vec = aggregator.get_codon(genome_id)
+            if codon_vec is None:
+                codon_vec = np.zeros(codon_dim, dtype=np.float32)
+
         # Phát contig thuận (+ RC) cho mỗi cửa sổ
         for contig_seq, w_start, w_end in windows:
             if use_features:
@@ -164,6 +173,8 @@ def generate_dataset_contigs(
             if use_features:
                 all_activations.append(activation)
                 all_gene_stats.append(gene_stats)
+                if has_codon:
+                    all_codon.append(codon_vec)
 
             # Reverse complement — features giống hệt (cùng vùng genomic)
             if use_reverse_complement:
@@ -172,7 +183,11 @@ def generate_dataset_contigs(
                 if use_features:
                     all_activations.append(activation)
                     all_gene_stats.append(gene_stats)
+                    if has_codon:
+                        all_codon.append(codon_vec)
 
     if use_features:
+        if has_codon:
+            return all_sequences, all_labels, all_activations, all_gene_stats, all_codon
         return all_sequences, all_labels, all_activations, all_gene_stats
     return all_sequences, all_labels

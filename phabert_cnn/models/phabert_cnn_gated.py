@@ -162,20 +162,25 @@ class FamilyCrossAttention(nn.Module):
                 activation: Optional[torch.Tensor]) -> torch.Tensor:
         if activation is None:
             return h
-        B = h.size(0)
-        # Family tokens = embedding + activation-modulated bias
-        fam_tokens = self.fam_emb.weight.unsqueeze(0).expand(B, -1, -1)
-        fam_tokens = fam_tokens + self.act_proj(activation.unsqueeze(-1))
-        # Mask family với activation ≈ 0 (không có hit HMM)
         key_padding_mask = (activation.abs() < 1e-6)  # [B, N]
-        # Nếu cả batch toàn-zero (edge case), tránh NaN softmax bằng skip
-        if key_padding_mask.all():
+        # Sample nào toàn-zero → attention softmax trên toàn -inf = NaN.
+        # Chỉ chạy attention cho các sample hợp lệ, giữ nguyên h cho phần còn lại.
+        valid = ~key_padding_mask.all(dim=-1)  # [B]
+        if not valid.any():
             return h
+        h_valid = h[valid]
+        act_valid = activation[valid]
+        Bv = h_valid.size(0)
+        fam_tokens = self.fam_emb.weight.unsqueeze(0).expand(Bv, -1, -1)
+        fam_tokens = fam_tokens + self.act_proj(act_valid.unsqueeze(-1))
+        kpm_valid = (act_valid.abs() < 1e-6)
         attn_out, _ = self.attn(
-            query=h, key=fam_tokens, value=fam_tokens,
-            key_padding_mask=key_padding_mask, need_weights=False,
+            query=h_valid, key=fam_tokens, value=fam_tokens,
+            key_padding_mask=kpm_valid, need_weights=False,
         )
-        return h + self.residual_scale * attn_out
+        out = h.clone()
+        out[valid] = h_valid + self.residual_scale * attn_out
+        return out
 
 
 class CodonBranch(nn.Module):
@@ -239,27 +244,30 @@ class LearnableFamilyAggregator(nn.Module):
 
     def forward(self, activation: torch.Tensor) -> torch.Tensor:
         B = activation.size(0)
+        device, dtype = activation.device, activation.dtype
+        mask = (activation.abs() < 1e-6)                          # [B, N]
+        valid = ~mask.all(dim=-1)                                 # [B]
+        # Output mặc định = 0 (sau out_norm, zero vector là identity hợp lệ).
+        out_full = torch.zeros(
+            B, self.out_proj.out_features, device=device, dtype=dtype,
+        )
+        if not valid.any():
+            return out_full
+
         fam = self.fam_emb.weight.unsqueeze(0).expand(B, -1, -1)  # [B, N, d]
         fam_aug = torch.cat([fam, activation.unsqueeze(-1)], dim=-1)
         x = self.in_proj(fam_aug)                                 # [B, N, d]
-        mask = (activation.abs() < 1e-6)                          # [B, N]
-        # Edge case: toàn bộ batch không có hit nào → encoder + softmax trên
-        # mask toàn True sẽ NaN. Fallback: trả zeros.
-        if mask.all():
-            return torch.zeros(B, self.out_proj.out_features,
-                               device=activation.device, dtype=activation.dtype)
-        x = self.set_enc(x, src_key_padding_mask=mask)            # [B, N, d]
-        scores = self.pool_score(x).squeeze(-1)                   # [B, N]
-        scores = scores.masked_fill(mask, float("-inf"))
-        # Per-row: nếu hàng nào toàn -inf, gán uniform để tránh NaN
-        all_masked_rows = mask.all(dim=-1)
-        if all_masked_rows.any():
-            scores[all_masked_rows] = 0.0
-        weights = torch.softmax(scores, dim=-1).unsqueeze(-1)     # [B, N, 1]
-        agg = (weights * x).sum(dim=1)                            # [B, d]
-        out = self.out_proj(agg)
-        out = self.out_norm(out)
-        return out  # [B, d_out]
+
+        # Chạy encoder + pooling chỉ cho các sample hợp lệ để tránh NaN
+        # softmax khi row mask toàn True.
+        x_v = self.set_enc(x[valid], src_key_padding_mask=mask[valid])
+        scores = self.pool_score(x_v).squeeze(-1)                 # [Bv, N]
+        scores = scores.masked_fill(mask[valid], float("-inf"))
+        weights = torch.softmax(scores, dim=-1).unsqueeze(-1)     # [Bv, N, 1]
+        agg = (weights * x_v).sum(dim=1)                          # [Bv, d]
+        out_v = self.out_norm(self.out_proj(agg))
+        out_full[valid] = out_v
+        return out_full  # [B, d_out]
 
 
 # ============================================================

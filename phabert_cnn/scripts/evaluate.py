@@ -41,6 +41,10 @@ def parse_args():
     parser.add_argument("--no_gate", action="store_true")
     parser.add_argument("--no_gene_stats", action="store_true")
     parser.add_argument("--no_pathway_scores", action="store_true")
+    parser.add_argument("--use_cross_attn", action="store_true",
+                        help="Phải khớp cờ đã dùng khi huấn luyện")
+    parser.add_argument("--use_codon", action="store_true",
+                        help="Phải khớp cờ đã dùng khi huấn luyện")
     parser.add_argument("--lora", action="store_true",
                         help="Xác định mô hình đã được huấn luyện bằng phương pháp tối ưu hóa tham số cục bộ (LoRA), ảnh hưởng tới tên cấu trúc thư mục lưu trữ")
     parser.add_argument("--n_families", type=int, default=26)
@@ -60,12 +64,15 @@ def parse_args():
 # ================================================================
 
 def get_mode_suffix(args) -> str:
-    """Định dạng hậu tố của thư mục trọng số (checkpoint) — tuân thủ logic từ tệp train.py nhằm bảo đảm sự nhất quán."""
+    """Định dạng hậu tố của thư mục trọng số (checkpoint) — phải khớp train.py."""
     suffix = "gated" if args.gated else "baseline"
     if args.gated:
-        if args.no_gate:       suffix += "_nogate"
-        if args.no_gene_stats: suffix += "_nostats"
-        if args.lora:          suffix += "_lora"
+        if args.no_gate:           suffix += "_nogate"
+        if args.no_gene_stats:     suffix += "_nostats"
+        if args.no_pathway_scores: suffix += "_nopath"
+        if args.use_cross_attn:    suffix += "_xattn"
+        if args.use_codon:         suffix += "_codon"
+        if args.lora:              suffix += "_lora"
     return suffix
 
 
@@ -98,17 +105,25 @@ def evaluate_fold(
                 input_ids  = batch["input_ids"].to(device, non_blocking=True)
                 activation = batch["activation"].to(device, non_blocking=True)
                 gene_stats = batch["gene_stats"].to(device, non_blocking=True)
+                codon = batch.get("codon_features")
+                if codon is not None:
+                    codon = codon.to(device, non_blocking=True)
                 logits = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     activation_vector=activation,
                     gene_stats=gene_stats,
+                    codon_features=codon,
                 )
             else:
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
                 logits = model(input_ids=input_ids, attention_mask=attention_mask)
 
-        probs = torch.softmax(logits.float(), dim=-1)
+        logits = logits.float()
+        # Defensive: thay NaN/Inf nếu forward dính edge case (log cho dev)
+        if not torch.isfinite(logits).all():
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+        probs = torch.softmax(logits, dim=-1)
         preds = logits.argmax(dim=-1)
 
         all_preds.extend(preds.cpu().tolist())
@@ -163,18 +178,37 @@ def main():
         print(f"  Samples: {len(sequences)}")
 
         # ---- Truy xuất Đặc trưng (chỉ áp dụng đối với mô hình Gated) ----
-        acts = stats = None
+        acts = stats = codon = None
         if args.gated:
             feat_path = fold_dir / f"{args.eval_split}_features.pt"
             if not feat_path.exists():
                 print(f"  WARNING: features not found: {feat_path}  — skipping fold")
                 continue
-            acts, stats = load_features(str(feat_path), normalize=True)
+            # Phải dùng stats từ TRAIN split để normalise val/test → khớp phân
+            # phối mà mô hình đã thấy lúc train.  Nếu không có train features
+            # (hiếm), fallback: normalise bằng stats của chính split (không
+            # lý tưởng nhưng tốt hơn là lỗi hard).
+            train_feat_path = fold_dir / "train_features.pt"
+            if train_feat_path.exists():
+                _, _, _, norm_stats = load_features(
+                    str(train_feat_path), normalize=True,
+                )
+                acts, stats, codon, _ = load_features(
+                    str(feat_path), normalize=True, stats=norm_stats,
+                )
+            else:
+                print(f"  [!] Không có {train_feat_path}, dùng local stats.")
+                acts, stats, codon, _ = load_features(
+                    str(feat_path), normalize=True,
+                )
+            if not args.use_codon:
+                codon = None
 
         # ---- Cấu trúc Bộ nạp dữ liệu (Dataset / DataLoader) ----
         dataset = PhageContigDataset(
             sequences, labels, tokenizer, args.max_seq_length,
             activations=acts, gene_stats=stats,
+            codon_features=codon,
         )
         _extra = dict(
             num_workers=args.num_workers,
@@ -194,6 +228,8 @@ def main():
                 use_gate=not args.no_gate,
                 use_gene_stats=not args.no_gene_stats,
                 use_pathway_scores=not args.no_pathway_scores,
+                use_cross_attn=args.use_cross_attn,
+                use_codon=args.use_codon,
             )
         else:
             model = PhaBERTCNN(dnabert2_model_name=args.model_name)

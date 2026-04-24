@@ -331,13 +331,23 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, device,
 def evaluate(model, loader, criterion, device, gated):
     model.eval()
     total_loss = 0.0
+    nan_batches = 0
     all_preds, all_labels = [], []
     for batch in tqdm(loader, desc="Validation"):
         logits, labels = _forward(model, batch, device, gated)
+        logits = logits.float()
+        # Defensive: nếu forward có bất kỳ NaN/Inf nào → log và clamp.
+        # Root cause bug phải được fix trong model; đây chỉ để val không
+        # bị NaN loss làm hỏng metric tracking.
+        if not torch.isfinite(logits).all():
+            nan_batches += 1
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
         loss = criterion(logits, labels)
         total_loss += loss.item() * labels.size(0)
         all_preds.extend(logits.argmax(dim=-1).cpu().tolist())
         all_labels.extend(labels.cpu().tolist())
+    if nan_batches > 0:
+        print(f"  [!] {nan_batches} batch có logits NaN/Inf (đã clamp)")
     return total_loss / len(loader.dataset), compute_metrics(all_labels, all_preds)
 
 

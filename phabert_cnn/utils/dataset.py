@@ -92,15 +92,20 @@ class PhageContigDataset(Dataset):
 
 
 def load_features(features_path: str,
-                  normalize: bool = True
-                  ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+                  normalize: bool = True,
+                  stats: Optional[dict] = None,
+                  ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[dict]]:
     """
-    Kích hoạt quá trình tải các đặc trưng hệ gen (gene features) đã được tính toán tiền xử lý từ các định dạng lưu điện tử _features.pt.
+    Tải gene features từ _features.pt và chuẩn hoá.
+
+    Tham số:
+        stats: nếu cung cấp → dùng để áp normalization (train → val). Nếu None
+               và normalize=True → tính stats từ chính tập này và trả lại để
+               caller tái sử dụng cho các split khác (tránh train/val mismatch).
 
     Returns:
-        (activations [N, 26], gene_stats [N, 4], codon_features [N, 65] | None)
-        codon_features = None nếu file features cũ chưa có trường này
-        (backward-compat — train pipeline sẽ tự fallback).
+        (activations [N, 26], gene_stats [N, 4], codon_features [N, 65] | None,
+         stats_used [dict] | None)
     """
     features_path = Path(features_path)
     if not features_path.exists():
@@ -113,27 +118,36 @@ def load_features(features_path: str,
     if codon_features is not None:
         codon_features = codon_features.float()  # [N, 65]
 
-    if normalize:
-        # Z-score gene_stats
-        mean = gene_stats.mean(dim=0)
-        std = gene_stats.std(dim=0).clamp(min=1e-6)
-        gene_stats = (gene_stats - mean) / std
+    if not normalize:
+        return activations, gene_stats, codon_features, None
 
-        # Max-scale activations (bit-scores HMM biến thiên rộng giữa families)
-        act_max = activations.max(dim=0).values.clamp(min=1e-6)
-        activations = activations / act_max
-
-        # Codon features: log-transform RSCU + z-score GC3
-        # RSCU > 0, đuôi nặng → log1p ổn định
+    # Tính hoặc dùng lại stats (train → val phải dùng cùng stats).
+    if stats is None:
+        stats = {
+            "gs_mean":  gene_stats.mean(dim=0),
+            "gs_std":   gene_stats.std(dim=0).clamp(min=1e-6),
+            "act_max":  activations.max(dim=0).values.clamp(min=1e-6),
+        }
         if codon_features is not None:
-            rscu = torch.log1p(codon_features[:, :64])
             gc3 = codon_features[:, 64:65]
-            gc3_mean = gc3.mean(dim=0)
-            gc3_std = gc3.std(dim=0).clamp(min=1e-6)
-            gc3 = (gc3 - gc3_mean) / gc3_std
-            codon_features = torch.cat([rscu, gc3], dim=-1)
+            stats["gc3_mean"] = gc3.mean(dim=0)
+            stats["gc3_std"]  = gc3.std(dim=0).clamp(min=1e-6)
 
-    return activations, gene_stats, codon_features
+    gene_stats  = (gene_stats - stats["gs_mean"]) / stats["gs_std"]
+    activations = activations / stats["act_max"]
+
+    if codon_features is not None:
+        rscu = torch.log1p(codon_features[:, :64])
+        if "gc3_mean" in stats and "gc3_std" in stats:
+            gc3 = (codon_features[:, 64:65] - stats["gc3_mean"]) / stats["gc3_std"]
+        else:
+            # File val có codon nhưng train thì không → dùng fallback z-score
+            # local (không lý tưởng, nhưng ít nhất không crash).
+            gc3_raw = codon_features[:, 64:65]
+            gc3 = (gc3_raw - gc3_raw.mean(0)) / gc3_raw.std(0).clamp(min=1e-6)
+        codon_features = torch.cat([rscu, gc3], dim=-1)
+
+    return activations, gene_stats, codon_features, stats
 
 
 def apply_undersampling(
@@ -182,9 +196,12 @@ def create_dataloaders(
     train_codon = val_codon = None
     if use_features:
         print(f"  Thực thi quá trình chép tải đặc trưng khối huấn luyện (training features) từ định vị trung chuyển: {train_features_path}")
-        train_acts, train_stats, train_codon = load_features(train_features_path)
+        train_acts, train_stats, train_codon, norm_stats = load_features(train_features_path)
         print(f"  Thực thi quá trình chép tải đặc trưng mảng đối chiếu (validation features) từ định vị: {val_features_path}")
-        val_acts, val_stats, val_codon = load_features(val_features_path)
+        # Dùng stats từ TRAIN để chuẩn hoá VAL → tránh train/val distribution mismatch.
+        val_acts, val_stats, val_codon, _ = load_features(
+            val_features_path, stats=norm_stats,
+        )
         if train_codon is None:
             print("  [!] Codon features không có trong file features (file cũ). "
                   "Bỏ qua codon branch — chạy lại preprocess_gene_features.py để bật.")

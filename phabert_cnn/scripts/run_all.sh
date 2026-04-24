@@ -38,11 +38,11 @@ echo "Working directory: $(pwd)"
 # ============================================================
 # Default parameters
 # ============================================================
-SKIP_ANNOTATE=false
-SKIP_PREPARE=false
-USE_LORA=false
+SKIP_ANNOTATE=true
+SKIP_PREPARE=true
+USE_LORA=true
 USE_COMPILE=false
-RESET_CACHE=false            # Xoá after_warmup.pt + best_model.pt trước khi chạy
+RESET_CACHE=true            # Xoá after_warmup.pt + best_model.pt trước khi chạy
 MASK_LYSO=false              # Ablation: zero-out exclusive lysogenic markers
 EVAL_SPLIT=test              # val cho tuning, test cho final reporting
 GPU_ID=0

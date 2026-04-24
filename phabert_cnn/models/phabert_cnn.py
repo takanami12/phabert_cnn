@@ -66,26 +66,28 @@ class MultiScaleCNNBranch(nn.Module):
     Max Pooling thích ứng 1 chiều (AdaptiveMaxPool1d) triệt tiêu chiều không gian.
     """
 
-    def __init__(self, in_channels: int, kernel_size: int):
+    def __init__(self, in_channels: int, kernel_size: int, dropout: float = 0.2):
         super().__init__()
 
         padding1 = kernel_size // 2
         padding2 = kernel_size // 2
 
+        # GroupNorm thay BatchNorm1d: BN running stats bị lệch vì train có
+        # reverse-complement augmentation còn val thì không → train/val
+        # distribution mismatch. GroupNorm không có running stats nên miễn
+        # nhiễm vấn đề này.
         self.conv_block = nn.Sequential(
-            # Lớp conv thứ nhất: 768 → 256
             nn.Conv1d(in_channels, 256, kernel_size=kernel_size, padding=padding1),
-            nn.BatchNorm1d(256),
+            nn.GroupNorm(8, 256),
             nn.ReLU(inplace=True),
 
-            # Lớp conv thứ hai: 256 → 128
             nn.Conv1d(256, 128, kernel_size=kernel_size, padding=padding2),
-            nn.BatchNorm1d(128),
+            nn.GroupNorm(8, 128),
             nn.ReLU(inplace=True),
         )
 
-        # Khối gộp cực đại toàn cục (Global max pooling) đảm bảo định dạng đầu ra không phụ thuộc độ dài chuỗi
         self.pool = nn.AdaptiveMaxPool1d(1)
+        self.out_drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -98,6 +100,7 @@ class MultiScaleCNNBranch(nn.Module):
         out = self.conv_block(x)  # (B, 128, L')
         out = self.pool(out)       # (B, 128, 1)
         out = out.squeeze(-1)      # (B, 128)
+        out = self.out_drop(out)
         return out
 
 
@@ -121,7 +124,7 @@ class PhaBERTCNN(nn.Module):
         attention_hidden_dim: int = 64,
         attention_dropout: float = 0.1,
         classifier_hidden_dim: int = 256,
-        classifier_dropout: float = 0.1,
+        classifier_dropout: float = 0.3,
         num_classes: int = 2,
     ):
         super().__init__()
@@ -193,7 +196,7 @@ class PhaBERTCNN(nn.Module):
         self.global_projection = nn.Sequential(
             nn.Linear(embedding_dim, 128),
             nn.ReLU(inplace=True),
-            nn.Dropout(attention_dropout),
+            nn.Dropout(max(attention_dropout, 0.3)),
         )
 
         # ============================================================
@@ -204,6 +207,7 @@ class PhaBERTCNN(nn.Module):
 
         self.classifier = nn.Sequential(
             nn.LayerNorm(total_feature_dim),
+            nn.Dropout(0.2),
             nn.Linear(total_feature_dim, classifier_hidden_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(classifier_dropout),

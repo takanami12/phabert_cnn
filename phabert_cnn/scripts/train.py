@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingLR
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from transformers import AutoTokenizer
@@ -68,7 +68,7 @@ def parse_args():
     # --- Giai đoạn 2 (Phase 2): Tinh chỉnh (Fine-tuning) ---
     parser.add_argument("--finetune_epochs", type=int, default=10)
     parser.add_argument("--backbone_lr", type=float, default=1e-5)
-    parser.add_argument("--backbone_wd", type=float, default=1e-5)
+    parser.add_argument("--backbone_wd", type=float, default=1e-4)
     parser.add_argument("--task_lr", type=float, default=1e-4)
     parser.add_argument("--task_wd", type=float, default=1e-4)
     parser.add_argument("--patience", type=int, default=3)
@@ -315,7 +315,7 @@ def _forward(model: nn.Module, batch: dict, device: torch.device, gated: bool,
 # ================================================================
 
 def train_one_epoch(model, loader, optimizer, scheduler, criterion, device,
-                    gated, scaler=None, mask_indices=None):
+                    gated, scaler=None, mask_indices=None, max_grad_norm=1.0):
     model.train()
     total_loss = 0.0
     all_preds, all_labels = [], []
@@ -329,12 +329,21 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, device,
                 logits, labels = _forward(model, batch, device, gated, mask_indices)
                 loss = criterion(logits, labels)
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad],
+                max_grad_norm,
+            )
             scaler.step(optimizer)
             scaler.update()
         else:
             logits, labels = _forward(model, batch, device, gated, mask_indices)
             loss = criterion(logits, labels)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad],
+                max_grad_norm,
+            )
             optimizer.step()
 
         if scheduler is not None:
@@ -440,7 +449,7 @@ def main():
     model = model.to(device)
     print(f"  Tổng số tham số: {sum(p.numel() for p in model.parameters()):,}")
 
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     use_amp   = device.type == "cuda"
     scaler    = torch.amp.GradScaler("cuda") if use_amp else None
     if use_amp:
@@ -616,13 +625,20 @@ def main():
     ], betas=(0.9, 0.999), eps=1e-6)
 
     total_steps_p2 = args.finetune_epochs * len(train_loader)
-    scheduler_p2   = OneCycleLR(
-        optimizer_p2,
-        max_lr=[args.backbone_lr, args.task_lr],
-        total_steps=total_steps_p2,
-        pct_start=0.1, div_factor=5, final_div_factor=50,
-    )
+    # Cosine decay: ít aggressive hơn OneCycleLR cho full fine-tune DNABERT-2.
+    # eta_min = 1% peak LR, linear warmup 10% đầu chu trình.
+    warmup_steps_p2 = max(1, int(0.1 * total_steps_p2))
 
+    def _lr_lambda(step):
+        if step < warmup_steps_p2:
+            return step / max(1, warmup_steps_p2)
+        progress = (step - warmup_steps_p2) / max(1, total_steps_p2 - warmup_steps_p2)
+        import math
+        return 0.01 + 0.99 * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler_p2 = torch.optim.lr_scheduler.LambdaLR(optimizer_p2, _lr_lambda)
+
+    best_val_loss   = float("inf")
     best_val_acc    = 0.0
     epochs_no_improve = 0
     best_epoch      = 0
@@ -656,7 +672,11 @@ def main():
         })
 
         val_acc = val_metrics["accuracy"]
-        if val_acc > best_val_acc:
+        # Early stopping theo val_loss (signal sớm hơn val_acc khi overfit
+        # dưới dạng confident-wrong). Checkpoint vẫn lưu theo best val_loss
+        # cho nhất quán; val_acc ghi log để reference.
+        if val_loss < best_val_loss:
+            best_val_loss     = val_loss
             best_val_acc      = val_acc
             best_epoch        = epoch + 1
             epochs_no_improve = 0
@@ -684,7 +704,8 @@ def main():
                 "val_metrics":      val_metrics,
                 "args":             vars(args),
             }, run_dir / "best_model.pt")
-            print(f"  ✓ Val accuracy tốt nhất mới: {val_acc:.2f}%")
+            print(f"  ✓ Val loss tốt nhất mới: {val_loss:.4f} "
+                  f"(acc={val_acc:.2f}%)")
         else:
             epochs_no_improve += 1
             print(f"  Không cải thiện ({epochs_no_improve}/{args.patience})")
@@ -693,14 +714,15 @@ def main():
                 break
 
     # ---------- Lưu log huấn luyện ----------
-    training_log["best_val_acc"] = best_val_acc
-    training_log["best_epoch"]   = best_epoch
+    training_log["best_val_acc"]  = best_val_acc
+    training_log["best_val_loss"] = best_val_loss
+    training_log["best_epoch"]    = best_epoch
     with open(run_dir / "training_log.json", "w") as f:
         json.dump(training_log, f, indent=2, default=str)
 
     print("\n" + "=" * 60)
-    print(f"Huấn luyện hoàn tất. Val accuracy tốt nhất: {best_val_acc:.2f}% "
-          f"tại epoch {best_epoch}")
+    print(f"Huấn luyện hoàn tất. Val loss tốt nhất: {best_val_loss:.4f} "
+          f"(acc={best_val_acc:.2f}%) tại epoch {best_epoch}")
     print(f"Checkpoint: {run_dir / 'best_model.pt'}")
     print("=" * 60)
 

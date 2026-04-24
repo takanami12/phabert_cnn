@@ -128,8 +128,10 @@ class FiLM(nn.Module):
 
     def forward(self, h: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         # h: [B, L, D], z: [B, C]
-        gamma = self.gamma(z).unsqueeze(1)  # [B, 1, D]
-        beta = self.beta(z).unsqueeze(1)    # [B, 1, D]
+        # tanh-bound gamma/beta → modulation không vỡ distribution backbone
+        # khi task_lr kéo weight khỏi 0 sau vài step.
+        gamma = torch.tanh(self.gamma(z)).unsqueeze(1)  # [B, 1, D] in [-1, 1]
+        beta = torch.tanh(self.beta(z)).unsqueeze(1)    # [B, 1, D] in [-1, 1]
         return h * (1.0 + gamma) + beta
 
 
@@ -145,7 +147,7 @@ class FamilyCrossAttention(nn.Module):
     """
 
     def __init__(self, n_families: int = 26, d_model: int = 768,
-                 n_heads: int = 4, dropout: float = 0.1):
+                 n_heads: int = 4, dropout: float = 0.2):
         super().__init__()
         self.n_families = n_families
         self.fam_emb = nn.Embedding(n_families, d_model)
@@ -195,7 +197,7 @@ class CodonBranch(nn.Module):
     """
 
     def __init__(self, codon_dim: int = 65, hidden_dim: int = 128,
-                 d_out: int = 64, dropout: float = 0.1):
+                 d_out: int = 64, dropout: float = 0.3):
         super().__init__()
         self.input_norm = nn.LayerNorm(codon_dim)
         self.fc1 = nn.Linear(codon_dim, hidden_dim)
@@ -228,7 +230,7 @@ class LearnableFamilyAggregator(nn.Module):
     """
 
     def __init__(self, n_families: int = 26, d_emb: int = 64, d_out: int = 32,
-                 n_heads: int = 4, n_layers: int = 1, dropout: float = 0.1):
+                 n_heads: int = 4, n_layers: int = 1, dropout: float = 0.3):
         super().__init__()
         self.n_families = n_families
         self.fam_emb = nn.Embedding(n_families, d_emb)
@@ -241,6 +243,7 @@ class LearnableFamilyAggregator(nn.Module):
         self.pool_score = nn.Linear(d_emb, 1)
         self.out_proj = nn.Linear(d_emb, d_out)
         self.out_norm = nn.LayerNorm(d_out)
+        self.out_drop = nn.Dropout(dropout)
 
     def forward(self, activation: torch.Tensor) -> torch.Tensor:
         B = activation.size(0)
@@ -265,7 +268,7 @@ class LearnableFamilyAggregator(nn.Module):
         scores = scores.masked_fill(mask[valid], float("-inf"))
         weights = torch.softmax(scores, dim=-1).unsqueeze(-1)     # [Bv, N, 1]
         agg = (weights * x_v).sum(dim=1)                          # [Bv, d]
-        out_v = self.out_norm(self.out_proj(agg))
+        out_v = self.out_drop(self.out_norm(self.out_proj(agg)))
         out_full[valid] = out_v
         return out_full  # [B, d_out]
 
@@ -389,7 +392,7 @@ class PhaBERTCNN_GeneGated(nn.Module):
         self.global_projection = nn.Sequential(
             nn.Linear(embedding_dim, global_out_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.3),
         )
 
         # --- Learnable family aggregator (thay PathwayScoreLayer) ---
@@ -418,9 +421,10 @@ class PhaBERTCNN_GeneGated(nn.Module):
             classifier_in += codon_out_dim                           # +64
         self.classifier = nn.Sequential(
             nn.LayerNorm(classifier_in),
+            nn.Dropout(0.2),
             nn.Linear(classifier_in, 256),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.3),
             nn.Linear(256, num_classes),
         )
 

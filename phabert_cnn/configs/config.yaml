@@ -95,7 +95,7 @@ training:
     backbone_optimizer:
       type: "AdamW"
       lr: 1.0e-5           # Conservative LR for DNABERT-2
-      weight_decay: 1.0e-5
+      weight_decay: 1.0e-4 # Bumped 10x: chống backbone drift overfit
       betas: [0.9, 0.999]
       eps: 1.0e-6
     task_optimizer:
@@ -105,16 +105,16 @@ training:
       betas: [0.9, 0.999]
       eps: 1.0e-6
     scheduler:
-      type: "OneCycleLR"
-      pct_start: 0.1        # 10% warm-up period
-      div_factor: 5
-      final_div_factor: 50
-    
-    # Early stopping
+      type: "CosineAnnealingWithWarmup"
+      warmup_pct: 0.1       # 10% linear warmup
+      eta_min_ratio: 0.01   # eta_min = 1% peak_lr
+
+    # Early stopping: val_loss là signal sớm hơn val_acc khi model overfit
+    # dưới dạng confident-wrong (logits cực trị, argmax không đổi).
     early_stopping:
-      monitor: "val_accuracy"
+      monitor: "val_loss"
       patience: 3
-      mode: "max"
+      mode: "min"
 
   # General training settings
   batch_size: 16
@@ -123,6 +123,10 @@ training:
   
   # Loss function
   loss: "CrossEntropyLoss"
+  label_smoothing: 0.1
+
+  # Gradient clipping (chống gradient spike khi unfreeze 117M backbone + AMP fp16)
+  max_grad_norm: 1.0
 
 # ============================================================
 # Evaluation Configuration  

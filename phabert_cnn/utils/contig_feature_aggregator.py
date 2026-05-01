@@ -55,11 +55,104 @@ Sử dụng:
 """
 
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 
 import numpy as np
 import torch
+
+
+# ============================================================
+# Codon constants (standard genetic code) — duplicated from
+# data_annotation/preprocess_gene_features.py để tránh cross-package import
+# ============================================================
+
+_CODON_TABLE = {
+    'TTT': 'F', 'TTC': 'F', 'TTA': 'L', 'TTG': 'L',
+    'CTT': 'L', 'CTC': 'L', 'CTA': 'L', 'CTG': 'L',
+    'ATT': 'I', 'ATC': 'I', 'ATA': 'I', 'ATG': 'M',
+    'GTT': 'V', 'GTC': 'V', 'GTA': 'V', 'GTG': 'V',
+    'TCT': 'S', 'TCC': 'S', 'TCA': 'S', 'TCG': 'S',
+    'CCT': 'P', 'CCC': 'P', 'CCA': 'P', 'CCG': 'P',
+    'ACT': 'T', 'ACC': 'T', 'ACA': 'T', 'ACG': 'T',
+    'GCT': 'A', 'GCC': 'A', 'GCA': 'A', 'GCG': 'A',
+    'TAT': 'Y', 'TAC': 'Y', 'TAA': '*', 'TAG': '*',
+    'CAT': 'H', 'CAC': 'H', 'CAA': 'Q', 'CAG': 'Q',
+    'AAT': 'N', 'AAC': 'N', 'AAA': 'K', 'AAG': 'K',
+    'GAT': 'D', 'GAC': 'D', 'GAA': 'E', 'GAG': 'E',
+    'TGT': 'C', 'TGC': 'C', 'TGA': '*', 'TGG': 'W',
+    'CGT': 'R', 'CGC': 'R', 'CGA': 'R', 'CGG': 'R',
+    'AGT': 'S', 'AGC': 'S', 'AGA': 'R', 'AGG': 'R',
+    'GGT': 'G', 'GGC': 'G', 'GGA': 'G', 'GGG': 'G',
+}
+_ALL_CODONS = sorted(_CODON_TABLE.keys())
+_CODON_IDX = {c: i for i, c in enumerate(_ALL_CODONS)}
+_AA_TO_SYN: Dict[str, List[str]] = {}
+for _c, _aa in _CODON_TABLE.items():
+    _AA_TO_SYN.setdefault(_aa, []).append(_c)
+
+CODON_FEATURE_DIM = 65  # 64 RSCU + 1 GC3
+
+_COMPLEMENT_TABLE = str.maketrans("ACGTN", "TGCAN")
+
+
+def _reverse_complement(seq: str) -> str:
+    return seq.translate(_COMPLEMENT_TABLE)[::-1]
+
+
+def _compute_codon_features(cds_sequences: List[str]) -> np.ndarray:
+    """
+    Tính 65-d codon vector (64 RSCU + 1 GC3) từ list CDS sequences.
+    Mỗi CDS phải bắt đầu ở frame 0 (đã căn chỉnh gene start).
+    Khi không có codon hợp lệ → trả về uniform RSCU=1.0, GC3=0.5.
+    """
+    feat = np.zeros(CODON_FEATURE_DIM, dtype=np.float32)
+    feat[:64] = 1.0
+    feat[64] = 0.5
+
+    if not cds_sequences:
+        return feat
+
+    counter: Counter = Counter()
+    third_gc = 0
+    third_total = 0
+    valid_chars = set("ACGT")
+
+    for cds in cds_sequences:
+        cds = cds.upper()
+        for i in range(0, len(cds) - 2, 3):
+            codon = cds[i:i + 3]
+            if len(codon) != 3:
+                continue
+            if not all(ch in valid_chars for ch in codon):
+                continue
+            counter[codon] += 1
+            third_total += 1
+            if codon[2] in ("G", "C"):
+                third_gc += 1
+
+    if sum(counter.values()) == 0:
+        return feat
+
+    aa_totals: Dict[str, int] = {aa: 0 for aa in _AA_TO_SYN}
+    for codon, count in counter.items():
+        aa = _CODON_TABLE.get(codon)
+        if aa is not None:
+            aa_totals[aa] += count
+
+    for codon, idx in _CODON_IDX.items():
+        aa = _CODON_TABLE[codon]
+        aa_total = aa_totals[aa]
+        n_syn = len(_AA_TO_SYN[aa])
+        if aa_total > 0 and n_syn > 0:
+            expected = aa_total / n_syn
+            feat[idx] = counter[codon] / expected if expected > 0 else 1.0
+        else:
+            feat[idx] = 1.0
+
+    feat[64] = third_gc / third_total if third_total > 0 else 0.5
+    return feat
 
 
 class ContigFeatureAggregator:
@@ -154,7 +247,8 @@ class ContigFeatureAggregator:
         fwd_end: int,
         overlap_min: float = 0.5,
         coords_are_one_based: bool = False,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        contig_seq: Optional[str] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Tổng hợp features cho một cửa sổ contig.
 
@@ -164,33 +258,42 @@ class ContigFeatureAggregator:
             fwd_end:             vị trí end 0-based (exclusive)
             overlap_min:         tỷ lệ overlap tối thiểu của gene HOẶC cửa sổ
             coords_are_one_based: đặt True nếu fwd_start theo 1-based
+            contig_seq:          chuỗi DNA của contig (forward strand, đã upper).
+                                 Bắt buộc cho codon features. Nếu None → trả default.
 
         Returns:
-            activation: np.ndarray[N_FAMILIES] — max HMM bit-score per family
-            gene_stats: np.ndarray[4] — count, density(gene/kb),
-                                        coding_fraction, strand_bias
+            activation:      np.ndarray[N_FAMILIES] — max HMM bit-score per family
+            gene_stats:      np.ndarray[4] — count, density(gene/kb),
+                                             coding_fraction, strand_bias
+            codon_features:  np.ndarray[65] — 64 RSCU + 1 GC3, per-contig
+                             (chỉ tính trên CDS overlap window, frame-aware)
 
         Lưu ý: features GIỐNG HỆT cho contig và reverse complement của nó
-               (cùng vùng genomic nhìn từ strand ngược lại).
+               (cùng vùng genomic nhìn từ strand ngược lại — codon RSCU tính
+               trên gene strand, không phụ thuộc strand của contig nhìn vào).
         """
         activation = np.zeros(self.n_families, dtype=np.float32)
         gene_stats = np.zeros(4, dtype=np.float32)
+        default_codon = np.zeros(CODON_FEATURE_DIM, dtype=np.float32)
+        default_codon[:64] = 1.0
+        default_codon[64] = 0.5
 
         genes = self.genome_to_genes.get(genome_id)
         if not genes:
-            return activation, gene_stats
+            return activation, gene_stats, default_codon
 
         # Căn chỉnh tọa độ với gene coords (Pyrodigal dùng 1-based inclusive)
         contig_start = fwd_start + (0 if coords_are_one_based else 1)
         contig_end = fwd_end
         contig_len = fwd_end - fwd_start
         if contig_len <= 0:
-            return activation, gene_stats
+            return activation, gene_stats, default_codon
 
         coding_bp = 0
         n_fwd = 0
         n_rev = 0
         n_overlapping = 0
+        cds_segments: List[str] = []
 
         for gene in genes:
             g_start = gene["start"]
@@ -218,7 +321,8 @@ class ContigFeatureAggregator:
             n_overlapping += 1
             coding_bp += ovl_len
 
-            if gene.get("strand", 1) == 1:
+            strand = gene.get("strand", 1)
+            if strand == 1:
                 n_fwd += 1
             else:
                 n_rev += 1
@@ -228,6 +332,30 @@ class ContigFeatureAggregator:
                 fam_idx = self.family_name_to_idx.get(family_name)
                 if fam_idx is not None:
                     activation[fam_idx] = max(activation[fam_idx], score)
+
+            # Trích CDS segment trong window (frame-aware) — cần contig_seq
+            if contig_seq is not None:
+                # Vị trí 0-based trong contig (contig_seq[0] = base tại fwd_start)
+                in_contig_start = ovl_start - 1 - fwd_start
+                in_contig_end = ovl_end - fwd_start  # exclusive
+                in_contig_start = max(0, in_contig_start)
+                in_contig_end = min(contig_len, in_contig_end)
+                if in_contig_end <= in_contig_start:
+                    continue
+                raw_segment = contig_seq[in_contig_start:in_contig_end]
+
+                if strand == 1:
+                    # Frame offset = bp từ gene start tới ovl_start
+                    frame_offset = (ovl_start - g_start) % 3
+                    cds_segment = raw_segment[frame_offset:]
+                else:
+                    # Strand âm: gene đọc từ g_end về g_start (RC)
+                    rc_segment = _reverse_complement(raw_segment)
+                    frame_offset = (g_end - ovl_end) % 3
+                    cds_segment = rc_segment[frame_offset:]
+
+                if cds_segment:
+                    cds_segments.append(cds_segment)
 
         # Thống kê gene
         if n_overlapping > 0:
@@ -243,7 +371,13 @@ class ContigFeatureAggregator:
             [n_overlapping, density, coding_frac, strand_bias],
             dtype=np.float32,
         )
-        return activation, gene_stats
+
+        if contig_seq is None:
+            codon_features = default_codon
+        else:
+            codon_features = _compute_codon_features(cds_segments)
+
+        return activation, gene_stats, codon_features
 
 
 INTEGRATION_EXAMPLE = """

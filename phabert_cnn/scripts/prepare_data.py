@@ -88,6 +88,7 @@ def save_fold_split(
     labels,
     activations=None,
     gene_stats=None,
+    codon_features=None,
     n_families=None,
 ):
     """Tiến hành lưu một phân vùng đánh giá (fold, split) — bao gồm định dạng dữ liệu tuần tự chuẩn pkl và dữ liệu nạp bổ sung .pt (nếu được kích hoạt cấu hình module)."""
@@ -105,12 +106,19 @@ def save_fold_split(
         stats = np.stack(gene_stats) if gene_stats else np.zeros((0, 4), dtype=np.float32)
         n_genes = stats[:, 0].astype(np.int64) if stats.size else np.zeros(0, dtype=np.int64)
 
-        torch.save({
+        save_dict = {
             "activations": torch.from_numpy(acts.astype(np.float32)),
             "gene_stats":  torch.from_numpy(stats.astype(np.float32)),
             "n_genes":     torch.from_numpy(n_genes),
             "n_families":  int(n_families),
-        }, pt_path)
+        }
+
+        if codon_features is not None:
+            codon = np.stack(codon_features) if codon_features else np.zeros((0, 65), dtype=np.float32)
+            save_dict["codon_features"] = torch.from_numpy(codon.astype(np.float32))
+            save_dict["codon_feature_dim"] = int(codon.shape[1]) if codon.size else 65
+
+        torch.save(save_dict, pt_path)
 
 
 # ============================================================
@@ -250,10 +258,10 @@ def main():
                 )
 
                 if aggregator is not None:
-                    sequences, labels, activations, gene_stats = out
+                    sequences, labels, activations, gene_stats, codon_features = out
                 else:
                     sequences, labels = out
-                    activations, gene_stats = None, None
+                    activations, gene_stats, codon_features = None, None, None
 
                 save_fold_split(
                     fold_dir=fold_dir,
@@ -262,6 +270,7 @@ def main():
                     labels=labels,
                     activations=activations,
                     gene_stats=gene_stats,
+                    codon_features=codon_features,
                     n_families=n_families,
                 )
 

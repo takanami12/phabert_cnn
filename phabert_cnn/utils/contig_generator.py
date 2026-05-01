@@ -121,7 +121,7 @@ def generate_dataset_contigs(
 
     Returns:
         Nếu aggregator là None:  (sequences, labels)
-        Nếu có aggregator:       (sequences, labels, activations, gene_stats)
+        Nếu có aggregator:       (sequences, labels, activations, gene_stats, codon_features)
 
         Features cho contig reverse complement GIỐNG HỆT contig thuận
         (cùng vùng genomic, nhìn từ strand ngược lại).
@@ -131,6 +131,7 @@ def generate_dataset_contigs(
     all_labels: List[int] = []
     all_activations: List[np.ndarray] = []
     all_gene_stats: List[np.ndarray] = []
+    all_codon_features: List[np.ndarray] = []
 
     use_features = aggregator is not None
 
@@ -154,8 +155,10 @@ def generate_dataset_contigs(
         # Phát contig thuận (+ RC) cho mỗi cửa sổ
         for contig_seq, w_start, w_end in windows:
             if use_features:
-                activation, gene_stats = aggregator.get_features(
-                    genome_id, w_start, w_end, overlap_min=overlap_min,
+                activation, gene_stats, codon_features = aggregator.get_features(
+                    genome_id, w_start, w_end,
+                    overlap_min=overlap_min,
+                    contig_seq=contig_seq,
                 )
 
             # Contig thuận
@@ -164,6 +167,7 @@ def generate_dataset_contigs(
             if use_features:
                 all_activations.append(activation)
                 all_gene_stats.append(gene_stats)
+                all_codon_features.append(codon_features)
 
             # Reverse complement — features giống hệt (cùng vùng genomic)
             if use_reverse_complement:
@@ -172,7 +176,8 @@ def generate_dataset_contigs(
                 if use_features:
                     all_activations.append(activation)
                     all_gene_stats.append(gene_stats)
+                    all_codon_features.append(codon_features)
 
     if use_features:
-        return all_sequences, all_labels, all_activations, all_gene_stats
+        return all_sequences, all_labels, all_activations, all_gene_stats, all_codon_features
     return all_sequences, all_labels

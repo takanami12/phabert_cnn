@@ -161,7 +161,7 @@ echo "========================================================"
 
 TRAIN_START=$(date +%s)
 
-for group in A B C D; do
+for group in $GROUPS; do
     for ((fold=0; fold < $FOLDS; fold++)); do
         echo ""
         echo "--------------------------------------------------------"
@@ -200,7 +200,7 @@ echo "========================================================"
 echo "Step 3: Evaluating..."
 echo "========================================================"
 
-for group in A B C D; do
+for group in $GROUPS; do
     echo ""
     echo "--------------------------------------------------------"
     echo "Evaluating: Group $group"
